@@ -1,0 +1,9 @@
+**/node_modules
+web/dist
+server/target
+server/target-docker
+data
+export
+bot
+.env
+.git

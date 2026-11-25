@@ -1,0 +1,30 @@
+services:
+  pdfsign:
+    build: .
+    # set PDFSIGN_IMAGE / PDFSIGN_TAG to use the images pushed by the GitLab CI
+    image: ${PDFSIGN_IMAGE:-pdfsign}:${PDFSIGN_TAG:-latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      BACKUP_DIR: /backups
+      TZ: ${TZ:-UTC}
+    # run as the host user so data/ and export/ are plain files you own
+    user: "${PDFSIGN_UID:-1000}:${PDFSIGN_GID:-1000}"
+    volumes:
+      - ./data:/data:z
+      - ./export:/export:z
+      - ${BACKUP_HOST_DIR:-./backups}:/backups:z
+    ports:
+      # put a TLS reverse proxy (Traefik, Caddy, nginx, authentik's proxy...) in front
+      - "${PDFSIGN_BIND:-127.0.0.1:8080}:8080"
+
+  bot:
+    build: ./bot
+    image: ${PDFSIGN_BOT_IMAGE:-pdfsign-bot}:${PDFSIGN_TAG:-latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PDFSIGN_URL: http://pdfsign:8080
+    depends_on:
+      pdfsign:
+        condition: service_healthy

@@ -1,0 +1,7 @@
+.env
+data/
+export/
+server/target/
+server/target-docker/
+node_modules/
+web/dist/

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Weekly dependency updates, collected into a single merge request.",
+  "extends": [
+    "config:recommended",
+    "schedule:weekly",
+    "group:allNonMajor"
+  ],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "npm (bun): keep exact versions in package.json",
+      "matchManagers": ["bun"],
+      "rangeStrategy": "pin"
+    },
+    {
+      "description": "Cargo: write the new version into Cargo.toml as well (Cargo.lock + --locked is the pin)",
+      "matchManagers": ["cargo"],
+      "rangeStrategy": "bump"
+    },
+    {
+      "description": "Wait a few days before taking new package releases (yanked / compromised releases)",
+      "matchDatasources": ["npm", "crate"],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Major updates can break things: they are listed on the Dependency Dashboard and only get an MR when ticked there",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "svelte-check only supports TypeScript ^5 || ^6 (the bot is not affected)",
+      "matchFileNames": ["web/package.json"],
+      "matchPackageNames": ["typescript"],
+      "allowedVersions": "<7"
+    }
+  ],
+  "customManagers": [
+    {
+      "description": "Versions annotated with '# renovate: datasource=... depName=...' in shell scripts",
+      "customType": "regex",
+      "managerFilePatterns": ["/^scripts/.+\\.sh$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\n[A-Z_]+=\"?[^:\"]+:(?<currentValue>[^\"\\s]+)\"?"
+      ]
+    },
+    {
+      "description": "BuildKit image used by 'docker buildx create' in the GitLab CI",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.gitlab-ci\\.yml$/"],
+      "matchStrings": ["--driver-opt image=(?<depName>[^:\\s]+):(?<currentValue>\\S+)"],
+      "datasourceTemplate": "docker"
+    }
+  ]
+}
