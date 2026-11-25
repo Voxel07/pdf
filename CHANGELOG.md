@@ -1,0 +1,51 @@
+# Changelog
+
+All notable changes to pdfsign Tracker are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.0.2] - 2026-11-26
+
+### Added
+
+- Activity log in the admin UI (**Activity**): recent actions on templates, documents, people, API tokens, signing, the bot, DocuSeal imports, exports and backups, plus every server error. You can filter it by level, area and text, it refreshes itself, and it keeps the newest 5000 entries. The dashboard shows the latest entries and the error count of the last 24 hours.
+- Progress bar for the DocuSeal import: the current template, submission x of y and the current step.
+- Progress bar for exports: a disk export or ZIP download shows document x of y while the PDFs are rendered, then "packing" while the ZIP is built. Exports run as background jobs (`POST /api/admin/export/jobs`, `GET /api/admin/export/jobs/{id}`, `GET /api/admin/export/jobs/{id}/download`). The finished ZIP is downloaded once and kept on the server for at most 30 minutes.
+- Dark theme (near-black `#020409` background, amber `#764d0f` highlights, smoky white text). It follows the operating system by default, and the toggle in the admin navigation switches between system, dark and light.
+- Export of a single template: pick a template in the export panel (Dashboard, **API & export**, after an import) for a disk export or ZIP download, or run `pdfsign export --template <slug>` on the CLI. The ZIP file name includes the template slug.
+- In-browser PDF preview before downloading, for documents (detail page and list), the template preview with sample values, and the signed PDF on the signer page.
+- Sorting the people list by name, Discord account or number of documents (click a column header to switch between ascending and descending).
+- New template based on an existing one (**Templates → New template based on an existing one**, or **Copy as new template** in the editor). It copies the PDF, fields, sections, description and validity, but no documents or general links.
+- `GET /api/admin/docuseal/import` (import progress) and `GET /api/admin/activity`. The synchronous `POST /api/admin/export` and `GET /api/admin/export.zip` remain available and also accept a template.
+
+### Changed
+
+- The DocuSeal import runs in the background on the server. `POST /api/admin/docuseal/import` returns right away, and the page polls for progress. You can close the page, and the result is still shown when you come back.
+- DocuSeal requests are retried on rate limits (429), server errors and network failures, and `Retry-After` is respected.
+- Imported submitters with no known Discord ID or e-mail are matched to an existing person by name when exactly one person has that name and nothing contradicts it. Before, a duplicate person was created. A submitter's Discord ID is now also linked to a person found by e-mail or name.
+- The import result counts submissions that were already imported, are not completed yet, or failed. Before, these were all reported as "skipped".
+- The import now also fetches archived DocuSeal submissions.
+- An import writes each submission under the backup write gate instead of blocking backups for the whole import.
+
+### Fixed
+
+- A DocuSeal import of large templates could stop partway without any error: the import ran inside one HTTP request, and when a reverse proxy or the browser gave up, the server dropped the request and the rest of the import with it. One symptom was a second template with 180 submissions importing only 8. Running the import again now adds the missing submissions.
+- Import warnings and errors were only shown in the browser that started the import, and were lost when the request failed. They are now always written to the activity log.
+
+## [0.0.1] - 2026-11-25
+
+### Added
+
+- First release: PDF templates with text, date, number, select and signature fields, and sections that can be signed later.
+- Personal signing links with a name check, and general links / QR codes.
+- Validity periods, audit page, export to disk and as ZIP.
+- DocuSeal import, scheduled backups and restore.
+- authentik (OIDC) login with admin and staff roles, and a bot API with API tokens.
+- Discord bot.
+
+[Unreleased]: https://github.com/Voxel07/pdf/compare/0.0.2...HEAD
+[0.0.2]: https://github.com/Voxel07/pdf/compare/0.0.1...0.0.2
+[0.0.1]: https://github.com/Voxel07/pdf/releases/tag/0.0.1

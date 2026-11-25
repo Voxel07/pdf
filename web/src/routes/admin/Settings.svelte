@@ -1,13 +1,12 @@
 <script lang="ts">
-  import { admin, copy, downloadExportZip, fmtDateTime } from '../../lib/api';
+  import { admin, copy, fmtDateTime } from '../../lib/api';
   import { session, isAdmin } from '../../lib/session.svelte';
+  import ExportPanel from './ExportPanel.svelte';
 
   let keys = $state<any[]>([]);
   let users = $state<any[]>([]);
   let keyName = $state('discord-bot');
   let newKey = $state('');
-  let exportDir = $state('');
-  let exportMsg = $state('');
 
   async function load() {
     if (!isAdmin()) return;
@@ -21,12 +20,6 @@
     const r = await admin.post('/api-keys', { name: keyName });
     newKey = r.key;
     await load();
-  }
-
-  async function exportDisk() {
-    exportMsg = 'Exporting…';
-    const r = await admin.post('/export', { dir: exportDir || null });
-    exportMsg = `Wrote ${r.written} PDFs to ${r.dir}` + (r.failed.length ? `; failed: ${r.failed.join(', ')}` : '');
   }
 </script>
 
@@ -57,18 +50,7 @@
   </div>
 {/if}
 
-<div class="card">
-  <h2>Export</h2>
-  <p class="muted">Writes every signed document as <code>&lt;dir&gt;/&lt;template&gt;/&lt;date&gt;_&lt;name&gt;_&lt;id&gt;.pdf</code> plus <code>index.csv</code>. Re-running updates the files of continued documents. CLI: <code>docker compose exec pdfsign pdfsign export</code>.</p>
-  <div class="row">
-    {#if isAdmin()}
-      <input class="grow" style="flex:1;width:auto" bind:value={exportDir} placeholder={session.exportDir} />
-      <button class="primary" onclick={exportDisk}>Export to disk</button>
-    {/if}
-    <button onclick={async () => (exportMsg = await downloadExportZip())}>Download ZIP</button>
-  </div>
-  {#if exportMsg}<div class="success">{exportMsg}</div>{/if}
-</div>
+<ExportPanel showDir />
 
 {#if isAdmin()}
   <div class="card">

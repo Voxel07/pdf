@@ -11,6 +11,8 @@
   import Import from './Import.svelte';
   import Settings from './Settings.svelte';
   import Backups from './Backups.svelte';
+  import Activity from './Activity.svelte';
+  import { theme, nextTheme } from '../../lib/theme.svelte';
 
   let error = $state('');
 
@@ -29,6 +31,7 @@
     ['/admin/templates', 'Templates'],
     ['/admin/submissions', 'Documents'],
     ['/admin/persons', 'People'],
+    ['/admin/activity', 'Activity'],
     ['/admin/import', 'DocuSeal import', 'admin'],
     ['/admin/settings', 'API & export'],
     ['/admin/backups', 'Backups', 'admin'],
@@ -49,6 +52,7 @@
       {/each}
       <span class="spacer"></span>
       <span class="small muted">{session.user.name || session.user.username} · <span class="badge accent">{session.user.role}</span></span>
+      <button class="small ghost" onclick={nextTheme} title="Theme: {theme.choice} (click to change)" aria-label="Change theme, currently {theme.choice}">{theme.choice === 'dark' ? '🌙' : theme.choice === 'light' ? '☀️' : '🖥️'}</button>
       <a class="btn small" href="/auth/logout" data-external>Log out</a>
     </nav>
     <div class="content">
@@ -62,6 +66,8 @@
         <Submissions />
       {:else if sub === '/admin/persons'}
         <Persons />
+      {:else if sub === '/admin/activity'}
+        <Activity />
       {:else if sub === '/admin/import' && isAdmin()}
         <Import />
       {:else if sub === '/admin/backups' && isAdmin()}
@@ -76,12 +82,12 @@
 {/if}
 
 <style>
-  nav { display: flex; align-items: center; gap: 4px; background: white; border-bottom: 1px solid var(--border); padding: 8px 18px; flex-wrap: wrap; position: sticky; top: 0; z-index: 20; }
+  nav { display: flex; align-items: center; gap: 4px; background: var(--panel); border-bottom: 1px solid var(--border); padding: 8px 18px; flex-wrap: wrap; position: sticky; top: 0; z-index: 20; }
   .logo { font-weight: 700; margin-right: 18px; }
   .ver { font-weight: 400; font-size: 0.75rem; color: var(--muted); }
   nav a { padding: 6px 12px; border-radius: 6px; color: var(--text); font-weight: 500; font-size: 0.93rem; }
-  nav a:hover { background: #f0f2f6; text-decoration: none; }
-  nav a.active { background: var(--accent-soft); color: var(--accent); }
+  nav a:hover { background: var(--hover); text-decoration: none; }
+  nav a.active { background: var(--accent-soft); color: var(--accent-text); }
   .content { max-width: 1150px; margin: 0 auto; padding: 22px 18px 60px; }
   .wide .content { max-width: none; padding: 14px; }
 </style>

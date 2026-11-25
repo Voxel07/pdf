@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { admin, copy, fmtDate, type SubmissionSummary, type Template } from '../../lib/api';
+  import { admin, adminFetch, copy, fmtDate, type SubmissionSummary, type Template } from '../../lib/api';
+  import PdfPreview from '../../lib/PdfPreview.svelte';
   import { route, navigate } from '../../lib/router.svelte';
 
   let list = $state<SubmissionSummary[]>([]);
@@ -8,6 +9,7 @@
   let status = $state(route.query.get('status') ?? '');
   let q = $state('');
   let loading = $state(false);
+  let preview = $state<SubmissionSummary | null>(null);
 
   admin.get('/templates?archived=true').then((t) => (templates = t));
 
@@ -59,10 +61,18 @@
             <td>{fmtDate(s.completed_at)}</td>
             <td>{s.valid_until ? fmtDate(s.valid_until) : s.status === 'completed' ? '∞' : '—'}</td>
             <td class="muted">{fmtDate(s.updated_at)}</td>
-            <td><button class="small" onclick={(e) => { e.stopPropagation(); copy(s.url); }}>Copy link</button></td>
+            <td style="text-align:right;white-space:nowrap">
+              <button class="small" title="Preview the PDF" onclick={(e) => { e.stopPropagation(); preview = s; }}>Preview</button>
+              <button class="small" onclick={(e) => { e.stopPropagation(); copy(s.url); }}>Copy link</button>
+            </td>
           </tr>
         {/each}
       </tbody>
     </table>
   {/if}
 </div>
+
+{#if preview}
+  {@const p = preview}
+  <PdfPreview title="{p.template_name} — {p.person_name}" load={() => adminFetch(`/submissions/${p.id}/pdf`, 'document.pdf')} onclose={() => (preview = null)} />
+{/if}

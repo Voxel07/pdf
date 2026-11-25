@@ -1,14 +1,19 @@
 //! Import templates and completed submissions from DocuSeal (cloud or self-hosted) using
 //! its REST API. Imported submissions keep their values and signature images, so the
 //! signed PDFs can be recreated (and exported) by this application.
+//!
+//! An import runs as a background job ([`start`]); the admin UI polls [`progress`]. Every
+//! warning and error is also written to the activity log.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::activity;
 use crate::models::*;
 use crate::pdf;
 use crate::service::{self, *};
@@ -61,7 +66,7 @@ impl Client {
         }
         let http = reqwest::Client::builder()
             .user_agent("pdfsign-importer")
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| anyhow!(e))?;
         let url = reqwest::Url::parse(&base).map_err(|e| AppError::bad_request(format!("invalid base_url: {e}")))?;
@@ -89,9 +94,42 @@ impl Client {
         }
     }
 
+    /// Sends a request, retrying rate limits (429), server errors and network failures with
+    /// a growing delay (honouring `Retry-After`), so a long import survives upstream hiccups.
+    async fn send_retrying(&self, what: &str, make: impl Fn() -> reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
+        const ATTEMPTS: u32 = 6;
+        let mut delay = Duration::from_secs(1);
+        let mut attempt = 1;
+        loop {
+            let last = attempt == ATTEMPTS;
+            match make().send().await {
+                Ok(res) if !last && (res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS || res.status().is_server_error()) => {
+                    let wait = res
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .map(|s| Duration::from_secs(s.min(120)))
+                        .unwrap_or(delay);
+                    tracing::warn!("{what}: {} - retrying in {}s ({attempt}/{ATTEMPTS})", res.status(), wait.as_secs());
+                    tokio::time::sleep(wait).await;
+                }
+                Ok(res) => return Ok(res),
+                Err(e) if !last => {
+                    tracing::warn!("{what}: {e} - retrying in {}s ({attempt}/{ATTEMPTS})", delay.as_secs());
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(anyhow!(e).context(what.to_string())),
+            }
+            delay = (delay * 2).min(Duration::from_secs(30));
+            attempt += 1;
+        }
+    }
+
     async fn get(&self, path: &str, query: &[(&str, String)]) -> anyhow::Result<Value> {
         let url = format!("{}{}", self.base, path);
-        let res = self.http.get(&url).header("X-Auth-Token", &self.key).query(query).send().await.with_context(|| format!("GET {url}"))?;
+        let what = format!("GET {url}");
+        let res = self.send_retrying(&what, || self.http.get(&url).header("X-Auth-Token", &self.key).query(query)).await?;
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
@@ -100,9 +138,11 @@ impl Client {
         res.json().await.with_context(|| format!("decoding {url}"))
     }
 
-    /// Fetches all pages of a list endpoint (`{data, pagination: {next}}`).
+    /// Fetches all pages of a list endpoint (`{data, pagination: {next}}`). DocuSeal lists
+    /// newest first; `after=<pagination.next>` continues with the older entries.
     async fn list_all(&self, path: &str, extra: &[(&str, String)]) -> anyhow::Result<Vec<Value>> {
         let mut out = Vec::new();
+        let mut seen = HashSet::new();
         let mut after: Option<i64> = None;
         loop {
             let mut q: Vec<(&str, String)> = extra.to_vec();
@@ -112,11 +152,18 @@ impl Client {
             }
             let page = self.get(path, &q).await?;
             let data = page.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
-            let n = data.len();
-            let last_id = data.iter().filter_map(|d| d["id"].as_i64()).max();
-            out.extend(data);
-            let next = page.pointer("/pagination/next").and_then(Value::as_i64).or(last_id);
-            if n < 100 || next.is_none() || next == after {
+            let oldest = data.iter().filter_map(|d| d["id"].as_i64()).min();
+            let mut new = 0;
+            for d in data {
+                if seen.insert(d["id"].as_i64()) {
+                    out.push(d);
+                    new += 1;
+                }
+            }
+            let next = page.pointer("/pagination/next").and_then(Value::as_i64).or(oldest);
+            // stop on an empty page or one with nothing new (guards against a server that
+            // ignores `after`), not on a short page
+            if new == 0 || next.is_none() || next == after {
                 break;
             }
             after = next;
@@ -127,11 +174,12 @@ impl Client {
     /// Downloads a file URL. Tries without credentials first (file URLs are signed), then
     /// with the API token if the URL belongs to the configured instance.
     async fn download(&self, url: &str) -> anyhow::Result<Vec<u8>> {
-        let res = self.http.get(url).send().await?;
+        let what = format!("download {url}");
+        let res = self.send_retrying(&what, || self.http.get(url)).await?;
         let res = if res.status().is_success() || !self.same_origin(url) {
             res
         } else {
-            self.http.get(url).header("X-Auth-Token", &self.key).send().await?
+            self.send_retrying(&what, || self.http.get(url).header("X-Auth-Token", &self.key)).await?
         };
         if !res.status().is_success() {
             bail!("download {url} failed: {}", res.status());
@@ -172,26 +220,175 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct ImportReport {
     pub templates_created: usize,
     pub templates_reused: usize,
     pub submissions_imported: usize,
+    /// All submissions not imported in this run (the sum of the three counters below).
     pub submissions_skipped: usize,
+    /// Imported by an earlier run.
+    pub submissions_existing: usize,
+    /// Not completed by every submitter yet; a later import picks them up.
+    pub submissions_incomplete: usize,
+    /// Failed with an error (see `warnings` and the activity log); retried by a later import.
+    pub submissions_failed: usize,
     pub originals_saved: usize,
     pub persons_created: usize,
+    /// Submitters without a known Discord id / e-mail who were matched to a person by name.
+    pub persons_matched_by_name: usize,
     pub warnings: Vec<String>,
 }
 
-pub async fn import(state: &AppState, req: ImportRequest) -> AppResult<ImportReport> {
+/// State of the current (or last) import, polled by the admin UI for its progress bar.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ImportProgress {
+    pub running: bool,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub started_by: Option<String>,
+    /// What is happening right now, e.g. "downloading the PDF of 'Form 2026'".
+    pub phase: String,
+    /// 1-based index of the template being imported, and how many were selected.
+    pub template_index: usize,
+    pub template_total: usize,
+    pub template_name: Option<String>,
+    /// Submissions of the current template handled so far, and how many it has.
+    pub done: usize,
+    pub total: usize,
+    pub report: ImportReport,
+    /// Set when the import as a whole stopped with an error.
+    pub error: Option<String>,
+}
+
+/// A running import: updates the shared progress and sends warnings and errors both to the
+/// report (shown when the import is done) and to the activity log.
+struct Run<'a> {
+    state: &'a AppState,
+    actor: String,
+}
+
+impl Run<'_> {
+    fn update(&self, f: impl FnOnce(&mut ImportProgress)) {
+        f(&mut self.state.import.lock().unwrap());
+    }
+
+    fn phase(&self, phase: impl Into<String>) {
+        let phase = phase.into();
+        self.update(|p| p.phase = phase);
+    }
+
+    fn count(&self, f: impl FnOnce(&mut ImportReport)) {
+        self.update(|p| f(&mut p.report));
+    }
+
+    async fn warn(&self, msg: String) {
+        activity::warn(&self.state.pool, "import", Some(self.actor.as_str()), msg.clone()).await;
+        self.update(|p| p.report.warnings.push(msg));
+    }
+
+    async fn fail(&self, msg: String) {
+        activity::error(&self.state.pool, "import", Some(self.actor.as_str()), msg.clone()).await;
+        self.update(|p| p.report.warnings.push(msg));
+    }
+}
+
+/// Starts an import in the background and returns immediately; [`progress`] reports how far
+/// it got. The job does not depend on the HTTP request, so a proxy timeout or a closed browser
+/// tab can no longer cut it off halfway.
+pub fn start(state: &AppState, req: ImportRequest, actor: &str) -> AppResult<()> {
     let client = Client::new(req.connection.clone())?;
-    let mut report = ImportReport::default();
-    for id in &req.template_ids {
-        if let Err(e) = import_template(state, &client, *id, &req, &mut report).await {
-            report.warnings.push(format!("template {id}: {}", e.message));
+    if req.template_ids.is_empty() {
+        return Err(AppError::bad_request("select at least one template"));
+    }
+    {
+        let mut p = state.import.lock().unwrap();
+        if p.running {
+            return Err(AppError::conflict("import_running", "an import is already running"));
+        }
+        *p = ImportProgress {
+            running: true,
+            started_at: Some(now()),
+            started_by: Some(actor.to_string()),
+            template_total: req.template_ids.len(),
+            phase: "starting".into(),
+            ..Default::default()
+        };
+    }
+    let state = state.clone();
+    let actor = actor.to_string();
+    tokio::spawn(async move {
+        let job = tokio::spawn({
+            let state = state.clone();
+            let actor = actor.clone();
+            async move { run(&state, &client, &req, &actor).await }
+        });
+        // a panic inside the job must not leave the import marked as running forever
+        let error = job.await.err().map(|e| format!("the import stopped unexpectedly: {e}"));
+        if let Some(e) = &error {
+            activity::error(&state.pool, "import", Some(actor.as_str()), e.clone()).await;
+        }
+        let mut p = state.import.lock().unwrap();
+        p.running = false;
+        p.finished_at = Some(now());
+        p.phase = if error.is_some() { "failed".into() } else { "finished".into() };
+        p.error = error;
+    });
+    Ok(())
+}
+
+pub fn progress(state: &AppState) -> ImportProgress {
+    state.import.lock().unwrap().clone()
+}
+
+async fn run(state: &AppState, client: &Client, req: &ImportRequest, actor: &str) {
+    let job = Run { state, actor: actor.to_string() };
+    activity::info(
+        &state.pool,
+        "import",
+        Some(actor),
+        format!("DocuSeal import of {} template(s) from {} started", req.template_ids.len(), client.instance),
+    )
+    .await;
+    for (i, id) in req.template_ids.iter().enumerate() {
+        job.update(|p| {
+            p.template_index = i + 1;
+            p.template_name = None;
+            p.done = 0;
+            p.total = 0;
+        });
+        if let Err(e) = import_template(&job, client, *id, req).await {
+            job.fail(format!("template {id}: {}", e.message)).await;
         }
     }
-    Ok(report)
+    let r = progress(state).report;
+    let level = if r.submissions_failed > 0 { activity::Level::Warn } else { activity::Level::Info };
+    activity::log(
+        &state.pool,
+        level,
+        "import",
+        Some(actor),
+        format!(
+            "DocuSeal import finished: {} template(s) created, {} reused; {} submission(s) imported, {} already imported, \
+             {} not completed yet, {} failed; {} people created, {} matched by name; {} original PDF(s) saved",
+            r.templates_created,
+            r.templates_reused,
+            r.submissions_imported,
+            r.submissions_existing,
+            r.submissions_incomplete,
+            r.submissions_failed,
+            r.persons_created,
+            r.persons_matched_by_name,
+            r.originals_saved
+        ),
+    )
+    .await;
+}
+
+enum Outcome {
+    Imported,
+    Existing,
+    Incomplete,
 }
 
 /// Maps a DocuSeal field type to ours. `None` = not importable.
@@ -207,16 +404,13 @@ fn map_kind(t: &str, has_options: bool) -> Option<FieldKind> {
     })
 }
 
-async fn import_template(
-    state: &AppState,
-    client: &Client,
-    ds_id: i64,
-    req: &ImportRequest,
-    report: &mut ImportReport,
-) -> AppResult<()> {
+async fn import_template(job: &Run<'_>, client: &Client, ds_id: i64, req: &ImportRequest) -> AppResult<()> {
+    let state = job.state;
+    job.phase(format!("loading DocuSeal template {ds_id}"));
     let ds = client.get(&format!("/templates/{ds_id}"), &[]).await.map_err(upstream)?;
     let (source, legacy_source) = client.source_keys("template", ds_id);
     let name = ds["name"].as_str().unwrap_or("Imported template").to_string();
+    job.update(|p| p.template_name = Some(name.clone()));
 
     // submitter roles -> sections
     let roles: Vec<(String, String)> = ds["submitters"]
@@ -236,9 +430,10 @@ async fn import_template(
         .fetch_optional(&state.pool)
         .await?;
     let template = if let Some((id,)) = existing {
-        report.templates_reused += 1;
+        job.count(|r| r.templates_reused += 1);
         get_template(&state.pool, &id).await?
     } else {
+        job.phase(format!("downloading the PDF of '{name}'"));
         // documents in schema order
         let docs = ds["documents"].as_array().cloned().unwrap_or_default();
         let order: Vec<String> = ds["schema"]
@@ -271,7 +466,7 @@ async fn import_template(
                 .map(|a| a.iter().filter_map(|o| o["value"].as_str().or(o.as_str()).map(String::from)).collect())
                 .unwrap_or_default();
             let Some(kind) = map_kind(ftype, !options.is_empty()) else {
-                report.warnings.push(format!("{name}: skipped unsupported field type '{ftype}'"));
+                job.warn(format!("'{name}': skipped unsupported field type '{ftype}'")).await;
                 continue;
             };
             let base_name = f["name"].as_str().filter(|n| !n.trim().is_empty()).map(String::from).unwrap_or_else(|| {
@@ -311,8 +506,13 @@ async fn import_template(
         } else {
             roles.iter().enumerate().map(|(i, (_, n))| Section { id: i as u32, name: n.clone(), required: true }).collect()
         };
-        report.templates_created += 1;
-        service::create_template(state, &name, &merged, fields, sections, Some(source.clone())).await?
+        let t = {
+            let _gate = state.gate.read().await;
+            service::create_template(state, &name, &merged, fields, sections, Some(source.clone())).await?
+        };
+        job.count(|r| r.templates_created += 1);
+        activity::info(&state.pool, "import", Some(job.actor.as_str()), format!("template '{name}' created from DocuSeal template {ds_id}")).await;
+        t
     };
 
     if !req.include_submissions {
@@ -326,18 +526,60 @@ async fn import_template(
         ds_fields.entry(key).or_default().push(f["uuid"].as_str().unwrap_or("").to_string());
     }
 
-    let list = client.list_all("/submissions", &[("template_id", ds_id.to_string())]).await.map_err(upstream)?;
+    job.phase(format!("listing the submissions of '{name}'"));
+    // archived submissions are listed separately; instances that ignore the filter return
+    // the same entries twice, which are dropped here
+    let mut list = Vec::new();
+    for archived in [false, true] {
+        let mut q = vec![("template_id", ds_id.to_string())];
+        if archived {
+            q.push(("archived", "true".into()));
+        }
+        list.extend(client.list_all("/submissions", &q).await.map_err(upstream)?);
+    }
+    let mut seen = HashSet::new();
+    list.retain(|s| seen.insert(s["id"].as_i64()));
+    let total = list.len();
+    let before = progress(state).report;
+    job.update(|p| p.total = total);
+    job.phase(format!("importing the submissions of '{name}'"));
     for item in list {
         let sid = item["id"].as_i64().unwrap_or_default();
-        match import_submission(state, client, &template, &roles, &ds_fields, sid, req, report).await {
-            Ok(true) => report.submissions_imported += 1,
-            Ok(false) => report.submissions_skipped += 1,
+        match import_submission(job, client, &template, &roles, &ds_fields, sid, req).await {
+            Ok(Outcome::Imported) => job.count(|r| r.submissions_imported += 1),
+            Ok(Outcome::Existing) => job.count(|r| {
+                r.submissions_existing += 1;
+                r.submissions_skipped += 1;
+            }),
+            Ok(Outcome::Incomplete) => job.count(|r| {
+                r.submissions_incomplete += 1;
+                r.submissions_skipped += 1;
+            }),
             Err(e) => {
-                report.submissions_skipped += 1;
-                report.warnings.push(format!("submission {sid}: {}", e.message));
+                job.count(|r| {
+                    r.submissions_failed += 1;
+                    r.submissions_skipped += 1;
+                });
+                job.fail(format!("'{name}', submission {sid}: {}", e.message)).await;
             }
         }
+        job.update(|p| p.done += 1);
     }
+    let after = progress(state).report;
+    let failed = after.submissions_failed - before.submissions_failed;
+    activity::log(
+        &state.pool,
+        if failed > 0 { activity::Level::Warn } else { activity::Level::Info },
+        "import",
+        Some(job.actor.as_str()),
+        format!(
+            "'{name}': {total} submission(s) in DocuSeal; {} imported, {} already imported, {} not completed yet, {failed} failed",
+            after.submissions_imported - before.submissions_imported,
+            after.submissions_existing - before.submissions_existing,
+            after.submissions_incomplete - before.submissions_incomplete,
+        ),
+    )
+    .await;
     Ok(())
 }
 
@@ -351,17 +593,16 @@ fn discord_id_of(sub: &Value) -> Option<String> {
     candidates.into_iter().flatten().find(|c| is_snowflake(c))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn import_submission(
-    state: &AppState,
+    job: &Run<'_>,
     client: &Client,
     t: &Template,
     roles: &[(String, String)],
     ds_fields: &HashMap<(String, String), Vec<String>>,
     sid: i64,
     req: &ImportRequest,
-    report: &mut ImportReport,
-) -> AppResult<bool> {
+) -> AppResult<Outcome> {
+    let state = job.state;
     let (source, legacy_source) = client.source_keys("submission", sid);
     let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM submissions WHERE source IN (?, ?)")
         .bind(&source)
@@ -369,26 +610,27 @@ async fn import_submission(
         .fetch_optional(&state.pool)
         .await?;
     if exists.is_some() {
-        return Ok(false);
+        return Ok(Outcome::Existing);
     }
     let ds = client.get(&format!("/submissions/{sid}"), &[]).await.map_err(upstream)?;
     let mut submitters: Vec<Value> = ds["submitters"].as_array().cloned().unwrap_or_default();
     if submitters.is_empty() {
-        return Ok(false);
+        return Ok(Outcome::Incomplete);
     }
     // every role is a required section here, so only fully completed submissions are imported;
     // partial ones are skipped (not recorded) and picked up by a later import
     let open = submitters.iter().filter(|s| s["completed_at"].as_str().is_none()).count();
     if open > 0 {
         if submitters.len() > open {
-            report.warnings.push(format!("submission {sid}: {open} of {} submitters have not completed yet - skipped for now", submitters.len()));
+            job.warn(format!("'{}', submission {sid}: {open} of {} submitters have not completed yet - skipped for now", t.name, submitters.len()))
+                .await;
         }
-        return Ok(false);
+        return Ok(Outcome::Incomplete);
     }
     submitters.sort_by_key(|s| roles.iter().position(|(u, _)| Some(u.as_str()) == s["uuid"].as_str()).unwrap_or(usize::MAX));
     let primary = &submitters[0];
 
-    // resolve or create the person
+    // resolve or create the person: Discord id, then e-mail, then a unique name
     let pname = primary["name"].as_str().filter(|n| !n.trim().is_empty()).map(String::from);
     let email = primary["email"].as_str().filter(|e| !e.is_empty()).map(String::from);
     let discord = discord_id_of(primary);
@@ -396,9 +638,27 @@ async fn import_submission(
     if let Some(d) = &discord {
         person = person_by_discord(&state.pool, d).await?;
     }
+    let discord_known = person.is_some();
     if person.is_none() {
         if let Some(e) = &email {
             person = sqlx::query_as("SELECT * FROM persons WHERE lower(email) = lower(?) LIMIT 1").bind(e).fetch_optional(&state.pool).await?;
+        }
+    }
+    // Repeat signers often use another e-mail address (or none) the next time. Take the one
+    // person with this name, unless their e-mail or Discord account says it is someone else.
+    let mut by_name = false;
+    if person.is_none() {
+        if let Some(n) = &pname {
+            let mut hits = persons_by_name(&state.pool, n).await?;
+            if hits.len() == 1 {
+                let p = hits.remove(0);
+                let other_email = matches!((&p.email, &email), (Some(a), Some(b)) if !a.eq_ignore_ascii_case(b));
+                let other_discord = discord.is_some() && !discord_accounts(&state.pool, &p.id).await?.is_empty();
+                if !other_email && !other_discord {
+                    person = Some(p);
+                    by_name = true;
+                }
+            }
         }
     }
     // a new person is only written together with the submission (see below)
@@ -406,7 +666,7 @@ async fn import_submission(
         Some(_) => None,
         None => {
             let name = pname.clone().or_else(|| email.clone()).unwrap_or_else(|| format!("DocuSeal submitter {sid}"));
-            Some(validate_person_name(&name)?)
+            Some(validate_person_name(&name).map_err(|e| AppError::bad_request(format!("submitter name '{name}': {}", e.message)))?)
         }
     };
     let person_id = person.as_ref().map(|p| p.id.clone()).unwrap_or_else(new_id);
@@ -451,7 +711,7 @@ async fn import_submission(
                     match bytes.and_then(|b| normalize_image(&b).ok()) {
                         Some(png) => (String::new(), Some(png)),
                         None => {
-                            report.warnings.push(format!("submission {sid}: could not load image for '{fname}'"));
+                            job.warn(format!("'{}', submission {sid}: could not load the image for '{fname}'", t.name)).await;
                             continue;
                         }
                     }
@@ -515,13 +775,14 @@ async fn import_submission(
                     let file = format!("{}_{}_{}_{}.pdf", &completed_at[..10.min(completed_at.len())], safe_filename(&person_name), sid, safe_filename(&n));
                     originals.push((file, bytes));
                 }
-                Err(e) => report.warnings.push(format!("submission {sid}: could not download '{n}': {e}")),
+                Err(e) => job.warn(format!("'{}', submission {sid}: could not download '{n}': {e:#}", t.name)).await,
             }
         }
     }
 
     // person, submission, rounds and values commit as one unit: an interrupted import leaves
-    // nothing behind, and the next run imports the submission again
+    // nothing behind, and the next run imports the submission again. A backup waits for it.
+    let _gate = state.gate.read().await;
     let mut tx = service::begin_write(&state.pool).await?;
     if let Some(name) = &new_person {
         sqlx::query("INSERT INTO persons (id, name, email, created_at) VALUES (?, ?, ?, ?)")
@@ -531,14 +792,15 @@ async fn import_submission(
             .bind(now())
             .execute(&mut *tx)
             .await?;
-        if let Some(d) = &discord {
-            sqlx::query("INSERT INTO discord_accounts (discord_id, person_id, username, linked_at) VALUES (?, ?, NULL, ?)")
-                .bind(d)
-                .bind(&person_id)
-                .bind(now())
-                .execute(&mut *tx)
-                .await?;
-        }
+    }
+    if let (Some(d), false) = (&discord, discord_known) {
+        // links the Discord id to the new or matched person (unless it is linked meanwhile)
+        sqlx::query("INSERT OR IGNORE INTO discord_accounts (discord_id, person_id, username, linked_at) VALUES (?, ?, NULL, ?)")
+            .bind(d)
+            .bind(&person_id)
+            .bind(now())
+            .execute(&mut *tx)
+            .await?;
     }
     let sub = service::create_submission(&mut tx, &t.id, &person_id, Some(&source)).await?;
     sqlx::query("UPDATE submissions SET status='completed', created_at=?, completed_at=?, updated_at=? WHERE id=?")
@@ -575,7 +837,10 @@ async fn import_submission(
     }
     tx.commit().await?;
     if new_person.is_some() {
-        report.persons_created += 1;
+        job.count(|r| r.persons_created += 1);
+    }
+    if by_name {
+        job.count(|r| r.persons_matched_by_name += 1);
     }
 
     if !originals.is_empty() {
@@ -592,9 +857,9 @@ async fn import_submission(
         }
         .await;
         match written {
-            Ok(n) => report.originals_saved += n,
-            Err(e) => report.warnings.push(format!("submission {sid}: imported, but writing originals to {} failed: {e}", dir.display())),
+            Ok(n) => job.count(|r| r.originals_saved += n),
+            Err(e) => job.warn(format!("'{}', submission {sid}: imported, but writing originals to {} failed: {e}", t.name, dir.display())).await,
         }
     }
-    Ok(true)
+    Ok(Outcome::Imported)
 }

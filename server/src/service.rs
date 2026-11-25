@@ -242,6 +242,23 @@ fn validate_template(t: &Template) -> AppResult<()> {
     Ok(())
 }
 
+/// Creates a new template from an existing one: same PDF, fields, sections, description and
+/// validity, but no documents, general links or import origin.
+pub async fn duplicate_template(state: &AppState, id: &str, name: Option<&str>) -> AppResult<Template> {
+    let src = get_template(&state.pool, id).await?;
+    let name = name.map(str::trim).filter(|n| !n.is_empty()).map(String::from).unwrap_or_else(|| format!("{} (copy)", src.name));
+    let pdf_bytes = template_pdf(state, &src.id).await?;
+    let fields: Vec<Field> = src.fields.iter().cloned().map(|f| Field { source_ref: None, ..f }).collect();
+    let t = create_template(state, &name, &pdf_bytes, fields, src.sections.clone(), None).await?;
+    sqlx::query("UPDATE templates SET description = ?, validity_days = ? WHERE id = ?")
+        .bind(&src.description)
+        .bind(src.validity_days)
+        .bind(&t.id)
+        .execute(&state.pool)
+        .await?;
+    get_template(&state.pool, &t.id).await
+}
+
 pub async fn template_pdf(state: &AppState, template_id: &str) -> AppResult<Vec<u8>> {
     tokio::fs::read(state.template_pdf_path(template_id))
         .await
@@ -952,23 +969,44 @@ pub async fn render_submission(state: &AppState, sub: &Submission) -> AppResult<
     Ok((filename, bytes))
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct ExportReport {
     pub dir: String,
     pub written: usize,
     pub failed: Vec<String>,
 }
 
-/// Writes every completed submission as PDF to `<dir>/<template-slug>/<file>.pdf` plus an
-/// `index.csv`. Files have deterministic names, so re-exporting updates continued forms.
-pub async fn export_all(state: &AppState, dir: &Path) -> AppResult<ExportReport> {
+/// Writes every completed submission (of one template, if given) as PDF to
+/// `<dir>/<template-slug>/<file>.pdf` plus an `index.csv`. Files have deterministic names, so
+/// re-exporting updates continued forms.
+pub async fn export_all(state: &AppState, dir: &Path, template: Option<&str>) -> AppResult<ExportReport> {
+    export_all_with(state, dir, template, &|_, _| {}).await
+}
+
+/// Called with `(documents done, documents total)` while an export runs.
+pub type ExportProgress<'a> = &'a (dyn Fn(usize, usize) + Send + Sync);
+
+/// [`export_all`] reporting its progress after every document.
+pub async fn export_all_with(state: &AppState, dir: &Path, template: Option<&str>, progress: ExportProgress<'_>) -> AppResult<ExportReport> {
+    let only = match template.filter(|t| !t.trim().is_empty()) {
+        Some(t) => Some(get_template(&state.pool, t.trim()).await?.id),
+        None => None,
+    };
     let subs: Vec<Submission> =
-        sqlx::query_as("SELECT * FROM submissions WHERE status = 'completed' ORDER BY completed_at").fetch_all(&state.pool).await?;
+        sqlx::query_as("SELECT * FROM submissions WHERE status = 'completed' AND (?1 IS NULL OR template_id = ?1) ORDER BY completed_at")
+            .bind(&only)
+            .fetch_all(&state.pool)
+            .await?;
     tokio::fs::create_dir_all(dir).await?;
+    let total = subs.len();
+    progress(0, total);
     let mut report = ExportReport { dir: dir.display().to_string(), ..Default::default() };
     let mut csv = String::from("file,template,person,discord_ids,status,completed_at,valid_until,submission_id\n");
     let mut templates: HashMap<String, Template> = HashMap::new();
-    for s in subs {
+    for (i, s) in subs.into_iter().enumerate() {
+        if i > 0 {
+            progress(i, total);
+        }
         if !templates.contains_key(&s.template_id) {
             templates.insert(s.template_id.clone(), get_template(&state.pool, &s.template_id).await?);
         }
@@ -999,6 +1037,7 @@ pub async fn export_all(state: &AppState, dir: &Path) -> AppResult<ExportReport>
         }
     }
     tokio::fs::write(dir.join("index.csv"), csv).await?;
+    progress(total, total);
     Ok(report)
 }
 
@@ -1008,9 +1047,14 @@ fn csv_escape(s: &str) -> String {
 
 /// Same as [`export_all`] but as an in-memory zip archive. Documents that could not be
 /// rendered are listed in `FAILED.txt` inside the archive and in the returned report.
-pub async fn export_zip(state: &AppState) -> AppResult<(Vec<u8>, ExportReport)> {
+pub async fn export_zip(state: &AppState, template: Option<&str>) -> AppResult<(Vec<u8>, ExportReport)> {
+    export_zip_with(state, template, &|_, _| {}).await
+}
+
+/// [`export_zip`] reporting its progress; after the last document the archive is packed.
+pub async fn export_zip_with(state: &AppState, template: Option<&str>, progress: ExportProgress<'_>) -> AppResult<(Vec<u8>, ExportReport)> {
     let tmp = std::env::temp_dir().join(format!("pdfsign-export-{}", random_token(10)));
-    let report = match export_all(state, &tmp).await {
+    let report = match export_all_with(state, &tmp, template, progress).await {
         Ok(r) => r,
         Err(e) => {
             let _ = tokio::fs::remove_dir_all(&tmp).await;
@@ -1039,13 +1083,7 @@ pub async fn export_zip(state: &AppState) -> AppResult<(Vec<u8>, ExportReport)> 
     .await
     .context("zip task")?;
     let _ = tokio::fs::remove_dir_all(&tmp).await;
-    let zip = zip?;
-    if report.failed.is_empty() {
-        tracing::info!("zip export: {} files", report.written);
-    } else {
-        tracing::warn!("zip export: {} files, {} failed: {}", report.written, report.failed.len(), report.failed.join("; "));
-    }
-    Ok((zip, report))
+    Ok((zip?, report))
 }
 
 fn walk(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {

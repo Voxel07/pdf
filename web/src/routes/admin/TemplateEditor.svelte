@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { admin, openBlob, randomId, type Field, type FieldKind, type Section, type Template } from '../../lib/api';
+  import { admin, adminFetch, randomId, type Field, type FieldKind, type Section, type Template } from '../../lib/api';
   import { loadPdf, type PdfDoc } from '../../lib/pdf';
   import { navigate } from '../../lib/router.svelte';
   import PdfViewer from '../../lib/PdfViewer.svelte';
   import GeneralLinks from './GeneralLinks.svelte';
+  import PdfPreview from '../../lib/PdfPreview.svelte';
 
   let { id }: { id: string } = $props();
 
@@ -224,9 +225,24 @@
     }
   }
 
+  let previewing = $state(false);
   async function preview() {
     if (dirty) await save();
-    if (!error) openBlob(await admin.blob(`/templates/${id}/preview.pdf`));
+    if (!error) previewing = true;
+  }
+
+  /** New template with the same PDF, fields, sections and settings (no documents). */
+  async function duplicateTemplate() {
+    if (!t) return;
+    if (dirty && !confirm('The copy is made from the last saved version. Continue without your unsaved changes?')) return;
+    const name = prompt('Name of the new template', `${t.name} (copy)`);
+    if (name === null) return;
+    try {
+      const c = await admin.post<Template>(`/templates/${id}/duplicate`, { name });
+      navigate(`/admin/templates/${c.id}`);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
   }
 
   async function archive() {
@@ -380,7 +396,10 @@
         <div class="field"><label for="tv">Valid for (days, empty = forever)</label>
           <input id="tv" type="number" min="1" value={t.validity_days ?? ''} oninput={(e) => { const v = (e.target as HTMLInputElement).value; t!.validity_days = v === '' ? null : +v; touch(); }} />
         </div>
-        <button class="small danger" onclick={archive}>Delete / archive template</button>
+        <div class="row">
+          <button class="small" onclick={duplicateTemplate} title="Create a new template from this one (PDF, fields, sections, settings)">Copy as new template</button>
+          <button class="small danger" onclick={archive}>Delete / archive template</button>
+        </div>
       </div>
 
       <GeneralLinks templateId={t.id} templateName={t.name} />
@@ -427,10 +446,14 @@
   </div>
 {/if}
 
+{#if previewing && t}
+  <PdfPreview title="Preview with sample values — {t.name}" load={() => adminFetch(`/templates/${id}/preview.pdf`, 'preview.pdf')} onclose={() => (previewing = false)} />
+{/if}
+
 <style>
   .toolbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 8px 12px; position: sticky; top: 52px; z-index: 10; margin-bottom: 12px; }
   .toolbar .title { margin: 0 10px; }
-  .toolbar button.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .toolbar button.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-text); }
   .editor { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 14px; align-items: start; }
   .canvas-col { max-width: 1000px; width: 100%; margin: 0 auto; }
   .side { position: sticky; top: 112px; max-height: calc(100vh - 124px); overflow: auto; }

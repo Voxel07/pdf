@@ -1,25 +1,17 @@
 <script lang="ts">
-  import { admin, downloadExportZip } from '../../lib/api';
-  import { session, isAdmin } from '../../lib/session.svelte';
+  import { admin, type ActivityEntry } from '../../lib/api';
+  import ActivityList from './ActivityList.svelte';
+  import ExportPanel from './ExportPanel.svelte';
 
   let stats = $state<any>(null);
-  let exportMsg = $state('');
-  let busy = $state(false);
+  let recent = $state<ActivityEntry[]>([]);
+  let errors24h = $state(0);
 
   admin.get('/stats').then((s) => (stats = s));
-
-  async function exportDisk() {
-    busy = true;
-    exportMsg = '';
-    try {
-      const r = await admin.post('/export');
-      exportMsg = `Wrote ${r.written} PDFs to ${r.dir}` + (r.failed.length ? ` (${r.failed.length} failed)` : '');
-    } catch (e) {
-      exportMsg = String(e);
-    } finally {
-      busy = false;
-    }
-  }
+  admin.get('/activity?limit=8').then((a) => {
+    recent = a.entries;
+    errors24h = a.errors_24h;
+  });
 </script>
 
 <h1>Dashboard</h1>
@@ -33,19 +25,20 @@
 {/if}
 
 <div class="card">
-  <h2>Export signed documents</h2>
-  <p class="muted">Recreates every signed document as a PDF (with an audit page) and stores it as a file, grouped by template, together with an <code>index.csv</code>.</p>
   <div class="row">
-    {#if isAdmin()}<button class="primary" onclick={exportDisk} disabled={busy}>{busy ? 'Exporting…' : `Export to server disk (${session.exportDir})`}</button>{/if}
-    <button onclick={async () => (exportMsg = await downloadExportZip())}>Download all as ZIP</button>
+    <h2 class="grow" style="margin:0">Recent activity</h2>
+    {#if errors24h}<a class="badge revoked" href="/admin/activity?level=error">{errors24h} error(s) in the last 24 h</a>{/if}
+    <a class="small" href="/admin/activity">Show all</a>
   </div>
-  {#if exportMsg}<div class="success">{exportMsg}</div>{/if}
+  <ActivityList entries={recent} compact />
 </div>
+
+<ExportPanel />
 
 <div class="card">
   <h2>Getting started</h2>
   <ol class="muted">
-    <li>Upload a PDF under <a href="/admin/templates">Templates</a> and place text, date, number, select and signature fields on it.</li>
+    <li>Upload a PDF under <a href="/admin/templates">Templates</a> and place text, date, number, select and signature fields on it — or start from a copy of an existing template.</li>
     <li>Use sections to split a form into parts that can be filled later (e.g. one section per equipment hand-out).</li>
     <li>Create an API key under <a href="/admin/settings">API & export</a> and configure the Discord bot with it.</li>
     <li>Or <a href="/admin/import">import</a> existing templates and signed documents from DocuSeal.</li>

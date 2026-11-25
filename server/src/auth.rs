@@ -132,7 +132,6 @@ impl FromRequestParts<AppState> for AdminUser {
 
 /// Integration API (bots): an API key created in the admin UI.
 pub struct ApiClient {
-    #[allow(dead_code)]
     pub key_name: String,
 }
 

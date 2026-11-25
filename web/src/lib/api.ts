@@ -92,11 +92,13 @@ export async function adminDownload(path: string, fallbackName: string): Promise
   return res.headers;
 }
 
-/** Downloads the ZIP export; returns a warning when some documents could not be rendered. */
-export async function downloadExportZip(): Promise<string> {
-  const h = await adminDownload('/export.zip', 'signatures.zip');
-  const failed = Number(h.get('x-export-failed') ?? 0);
-  return failed ? `${failed} document(s) could not be rendered and are missing from the ZIP. See FAILED.txt inside it.` : '';
+/** Fetches an admin file as a blob together with the file name the server suggests. */
+export async function adminFetch(path: string, fallbackName: string): Promise<{ blob: Blob; filename: string }> {
+  const res = await fetch(`/api/admin${path}`);
+  if (res.status === 401) toLogin();
+  if (!res.ok) return handle(res);
+  const m = /filename="([^"]+)"/.exec(res.headers.get('content-disposition') ?? '');
+  return { blob: await res.blob(), filename: m?.[1] ?? fallbackName };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -166,7 +168,16 @@ export interface SubmissionSummary {
   url: string;
 }
 
-export const fmtDate = (s?: string | null) => (s ? new Date(s).toLocaleDateString() : '—');
+export interface ActivityEntry {
+  id: number;
+  created_at: string;
+  level: 'info' | 'warn' | 'error';
+  category: string;
+  actor: string | null;
+  message: string;
+}
+
+export const fmtDate =(s?: string | null) => (s ? new Date(s).toLocaleDateString() : '—');
 export const fmtDateTime = (s?: string | null) => (s ? new Date(s).toLocaleString() : '—');
 
 export function randomId(len = 10) {

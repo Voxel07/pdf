@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { admin, adminDownload, copy, fmtDate, fmtDateTime } from '../../lib/api';
+  import { admin, adminDownload, adminFetch, copy, fmtDate, fmtDateTime } from '../../lib/api';
+  import PdfPreview from '../../lib/PdfPreview.svelte';
   import { navigate } from '../../lib/router.svelte';
   import { isAdmin } from '../../lib/session.svelte';
 
   let { id }: { id: string } = $props();
   let s = $state<any>(null);
   let error = $state('');
+  let previewing = $state(false);
 
   async function load() {
     try {
@@ -54,7 +56,8 @@
       </div>
     </div>
     <div class="row">
-      <button class="primary" onclick={() => adminDownload(`/submissions/${id}/pdf`, 'document.pdf')}>⬇ Download PDF</button>
+      <button class="primary" onclick={() => (previewing = true)}>👁 Preview PDF</button>
+      <button onclick={() => adminDownload(`/submissions/${id}/pdf`, 'document.pdf')}>⬇ Download PDF</button>
       <a class="btn" href="/admin/persons?q={encodeURIComponent(s.person_name)}">Person</a>
       <span class="spacer"></span>
       {#if s.locked}<button onclick={() => act('reset-lock')}>Unlock link</button>{/if}
@@ -63,6 +66,10 @@
       {#if isAdmin()}<button class="danger" onclick={remove}>Delete</button>{/if}
     </div>
   </div>
+
+  {#if previewing}
+    <PdfPreview title="{s.template_name} — {s.person_name}" load={() => adminFetch(`/submissions/${id}/pdf`, 'document.pdf')} onclose={() => (previewing = false)} />
+  {/if}
 
   <div class="card">
     <h2>Values</h2>

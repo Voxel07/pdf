@@ -36,10 +36,12 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        let mut res = (self.status, Json(json!({ "error": self.message, "code": self.code }))).into_response();
         if self.status.is_server_error() {
-            tracing::error!("{}: {}", self.code, self.message);
+            // picked up by `activity::record_errors`, which also writes the server log line
+            res.extensions_mut().insert(crate::activity::FailedRequest(format!("{}: {}", self.code, self.message)));
         }
-        (self.status, Json(json!({ "error": self.message, "code": self.code }))).into_response()
+        res
     }
 }
 

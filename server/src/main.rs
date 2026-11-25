@@ -1,6 +1,8 @@
+mod activity;
 mod auth;
 mod backup;
 mod docuseal;
+mod export_job;
 mod models;
 mod pdf;
 mod routes;
@@ -85,6 +87,9 @@ enum Cmd {
     Export {
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Only export the documents of this template (id or slug).
+        #[arg(long)]
+        template: Option<String>,
     },
     /// Create an API key for a bot / integration.
     CreateApiKey { name: String },
@@ -143,9 +148,9 @@ async fn main() -> Result<()> {
 
     match cli.cmd.unwrap_or(Cmd::Serve { bind: "0.0.0.0:8080".parse()? }) {
         Cmd::Serve { bind } => serve(state, bind).await,
-        Cmd::Export { out } => {
+        Cmd::Export { out, template } => {
             let dir = out.unwrap_or_else(|| state.cfg.export_dir.clone());
-            let report = service::export_all(&state, &dir).await.map_err(|e| anyhow::anyhow!(e.message))?;
+            let report = service::export_all(&state, &dir, template.as_deref()).await.map_err(|e| anyhow::anyhow!(e.message))?;
             println!("exported {} documents to {}", report.written, report.dir);
             for f in &report.failed {
                 eprintln!("failed: {f}");
@@ -196,10 +201,12 @@ async fn serve(state: AppState, bind: SocketAddr) -> Result<()> {
         .nest("/api/public", routes::public::router())
         .fallback_service(spa)
         .layer(axum::middleware::from_fn_with_state(state.clone(), backup::write_gate))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), activity::record_errors))
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
     backup::spawn_scheduler(state.clone());
+    activity::info(&state.pool, "server", None, format!("pdfsign {} started", version())).await;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("pdfsign {} listening on http://{bind} (public url {})", version(), state.cfg.public_url);
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;

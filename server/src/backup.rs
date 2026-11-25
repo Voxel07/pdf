@@ -191,7 +191,7 @@ pub async fn run_backup(state: &AppState, trigger: &str) -> AppResult<BackupStat
     status.last_duration_ms = Some(started.elapsed().as_millis() as u64);
     match result {
         Ok((file, size, pause_ms)) => {
-            tracing::info!("backup written: {file} ({size} bytes, app paused {pause_ms} ms)");
+            crate::activity::info(&state.pool, "backup", Some(trigger), format!("backup written: {file} ({size} bytes, app paused {pause_ms} ms)")).await;
             status.last_ok = Some(true);
             status.last_file = Some(file);
             status.last_size = Some(size);
@@ -199,7 +199,7 @@ pub async fn run_backup(state: &AppState, trigger: &str) -> AppResult<BackupStat
             status.last_error = None;
         }
         Err(e) => {
-            tracing::error!("backup failed: {e:#}");
+            crate::activity::error(&state.pool, "backup", Some(trigger), format!("backup failed: {e:#}")).await;
             status.last_ok = Some(false);
             status.last_error = Some(format!("{e:#}"));
         }
@@ -344,7 +344,7 @@ pub fn spawn_scheduler(state: AppState) {
             let due = status.next_run_at.as_deref().and_then(parse_ts).is_none_or(|t| t <= Utc::now());
             if due {
                 if let Err(e) = run_backup(&state, "schedule").await {
-                    tracing::error!("scheduled backup: {}", e.message);
+                    crate::activity::error(&state.pool, "backup", Some("schedule"), format!("scheduled backup: {}", e.message)).await;
                 }
             }
         }

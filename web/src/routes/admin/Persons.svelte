@@ -73,6 +73,34 @@
   const dupCount = $derived(list.reduce((m, p) => m.set(norm(p.name), (m.get(norm(p.name)) ?? 0) + 1), new Map<string, number>()));
   const isDup = (p: any) => (dupCount.get(norm(p.name)) ?? 0) > 1;
 
+  // sorting (client side; the server returns up to 1000 people)
+  type SortKey = 'name' | 'discord' | 'documents';
+  let sortKey = $state<SortKey>('name');
+  let sortDir = $state<1 | -1>(1);
+  function sortBy(k: SortKey) {
+    if (sortKey === k) sortDir = sortDir === 1 ? -1 : 1;
+    else {
+      sortKey = k;
+      sortDir = k === 'documents' ? -1 : 1;
+    }
+  }
+  const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
+  const discordLabel = (p: any) => p.discord_accounts.map((d: any) => d.username || d.discord_id).sort(collator.compare)[0] ?? '';
+  const sorted = $derived.by(() => {
+    const byName = (a: any, b: any) => collator.compare(a.name, b.name);
+    return list.toSorted((a, b) => {
+      if (sortKey === 'documents') return sortDir * (a.submission_count - b.submission_count) || byName(a, b);
+      if (sortKey === 'discord') {
+        const da = discordLabel(a), db = discordLabel(b);
+        // people without a Discord account always come last
+        if (!da !== !db) return da ? -1 : 1;
+        return sortDir * collator.compare(da, db) || byName(a, b);
+      }
+      return sortDir * byName(a, b);
+    });
+  });
+  const arrow = (k: SortKey) => (sortKey === k ? (sortDir === 1 ? ' ▲' : ' ▼') : '');
+
   function toggle(p: any) {
     openId = openId === p.id ? null : p.id;
     addDiscord = mergeInto = createdLink = '';
@@ -108,9 +136,14 @@
 <div class="card" style="margin-top:16px">
   <input placeholder="Search name, e-mail, Discord id or username" bind:value={q} />
   <table style="margin-top:10px">
-    <thead><tr><th>Name</th><th>Discord</th><th>Documents</th><th></th></tr></thead>
+    <thead><tr>
+      <th aria-sort={sortKey === 'name' ? (sortDir === 1 ? 'ascending' : 'descending') : 'none'}><button class="sort" class:on={sortKey === 'name'} onclick={() => sortBy('name')}>Name{arrow('name')}</button></th>
+      <th aria-sort={sortKey === 'discord' ? (sortDir === 1 ? 'ascending' : 'descending') : 'none'}><button class="sort" class:on={sortKey === 'discord'} onclick={() => sortBy('discord')}>Discord{arrow('discord')}</button></th>
+      <th aria-sort={sortKey === 'documents' ? (sortDir === 1 ? 'ascending' : 'descending') : 'none'}><button class="sort" class:on={sortKey === 'documents'} onclick={() => sortBy('documents')}>Documents{arrow('documents')}</button></th>
+      <th style="text-align:right"><span class="small muted" style="text-transform:none;font-weight:400">{list.length} {list.length === 1 ? 'person' : 'people'}</span></th>
+    </tr></thead>
     <tbody>
-      {#each list as p (p.id)}
+      {#each sorted as p (p.id)}
         <tr>
           <td><b>{p.name}</b>
             {#if isDup(p)}<span class="badge pending" title="Several people share this name - their zip code tells them apart on general links">same name{p.zip ? '' : ' · no zip!'}</span>{/if}
@@ -121,7 +154,7 @@
         </tr>
         {#if openId === p.id}
           <tr>
-            <td colspan="4" style="background:#fafbfc">
+            <td colspan="4" style="background:var(--panel-2)">
               <div class="grid2">
                 <div>
                   <label for="nm-{p.id}">Name (second factor for signing links)</label>

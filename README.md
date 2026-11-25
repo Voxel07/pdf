@@ -2,13 +2,15 @@
 
 A self-hosted alternative to DocuSeal, built for Discord communities.
 
-* **Templates:** upload a PDF and drag fields onto it: text, date, number, select (fixed list) and hand-drawn signatures.
+* **Templates:** upload a PDF and drag fields onto it: text, date, number, select (fixed list) and hand-drawn signatures. A new template can start as a copy of an existing one (PDF, fields, sections, settings), e.g. for next year's form.
 * **Sections:** a form is split into sections. Each section is signed and locked on its own. Required sections must be done on the first signing. Optional sections can be filled later from the same link, for example one row per equipment hand-out.
 * **Name check:** signing links are random tokens. Opening one also requires the signer's registered full name. Matching ignores case, accents and ü/ue-style spellings. After 10 wrong names (configurable) the link is locked. The name is not secret, so this is a check on top of the link, not an independent authentication factor: whoever holds the link and knows the name can sign.
 * **Validity:** a template can be valid for N days (for example 365 for an event waiver). The bot asks for a new signature only when no valid document exists.
 * **Lightweight storage:** SQLite. Values are stored as text and signatures as small PNGs. PDFs are rebuilt on demand, with an audit page listing every signing round (time, IP, user agent, name check).
-* **Export:** on request, every signed document is rebuilt and written as a PDF to disk (`export/<template>/<date>_<name>_<id>.pdf` plus `index.csv`), from the UI or the CLI, or downloaded as a ZIP. Nothing is exported automatically.
-* **DocuSeal import:** templates (PDF + fields) and completed submissions (values + signature images) are pulled through the DocuSeal API, and the signed PDFs are rebuilt here. You can also keep DocuSeal's original signed PDFs.
+* **Export:** on request, the signed documents of all templates or of one template are rebuilt and written as PDFs to disk (`export/<template>/<date>_<name>_<id>.pdf` plus `index.csv`), from the UI or the CLI, or downloaded as a ZIP. Nothing is exported automatically. Any document can be previewed in the browser before it is downloaded.
+* **DocuSeal import:** templates (PDF + fields) and completed submissions (values + signature images) are pulled through the DocuSeal API, and the signed PDFs are rebuilt here. The import runs in the background with a progress bar. You can also keep DocuSeal's original signed PDFs.
+* **Activity log:** recent actions (templates, documents, people, signing, bot, import, export, backups) and every server error, filterable in the admin UI under **Activity**.
+* **Light and dark theme:** follows the operating system; the admin UI has a toggle.
 * **General links + QR codes:** one link per template for everyone, e.g. printed at the entrance. People scan it, type their name, and either sign on the spot or see that they already have a valid signature. A zip code is only needed when several people share the name, and it is collected once from first-time signers.
 * **Backups:** scheduled (start time + interval + retention) into a host folder. Writes pause briefly while a consistent snapshot of the database (including active sessions) and the template PDFs is taken. The pause grows with the database size.
 * **Discord bot:** handles event sign-up checks, equipment hand-outs, and relinking a lost account to a new one.
@@ -131,17 +133,19 @@ Pick templates and import them. How things map:
 * Multi-document templates are merged into one PDF.
 * Each DocuSeal submitter role becomes a section.
 * Field types `text`, `number`, `date`, `select`/`radio`, `checkbox` (drawn as "X"), and `signature`/`initials`/`image`/`stamp` are imported. Other types are reported and skipped.
-* A submitter's `external_id` (or `metadata.discord_id`) that is a Discord ID is linked automatically. Other people can be linked under **People**.
+* Submitters are matched to existing people by Discord ID (`external_id` or `metadata.discord_id`), then e-mail, then a name that exactly one person has (unless that person's e-mail or Discord account says it is someone else). Everyone else becomes a new person; duplicates can be merged under **People**.
 * Only submissions that every submitter has completed are imported. Partly completed ones are skipped and picked up by a later import.
+* The import runs on the server in the background, so closing the page or a proxy timeout does not stop it. The page shows its progress and the result when you come back. DocuSeal rate limits (429) and temporary errors are retried.
 * Each submission (person, values, signing rounds) is written as one unit, so an interrupted import can simply be repeated. Importing again skips anything already imported. Imported IDs are qualified by the DocuSeal host, so two instances don't collide.
+* The result lists how many submissions were imported, already imported, not completed yet, or failed. Every warning and error is also written to the activity log (**Activity**, area `import`).
 * The API key is only sent to the configured DocuSeal host, not to other hosts that file URLs point to.
 
-Then click **Recreate & export all PDFs to disk**.
+Then export the PDFs from the panel below the result.
 
 ### Export / backup
 
-* UI: Dashboard or **API & export** → *Export to disk* (admin) or *Download ZIP*. Documents that fail to render are reported. In the ZIP they are listed in `FAILED.txt`.
-* CLI: `docker compose exec pdfsign pdfsign export [--out /export/somewhere]`. It exits non-zero if any document failed.
+* UI: Dashboard or **API & export** → pick *All templates* or one template → *Export to server disk* (admin) or *Download ZIP*. A progress bar shows the documents being rendered. The ZIP is built on the server and then downloaded. Documents that fail to render are reported and logged. In the ZIP they are listed in `FAILED.txt`.
+* CLI: `docker compose exec pdfsign pdfsign export [--out /export/somewhere] [--template <slug>]`. It exits non-zero if any document failed.
 * A disk export writes the current documents and a new `index.csv`. It does not delete files from earlier exports, such as revoked documents or files under an old name.
 * Back up `./data` (SQLite database + template PDFs). `./export` holds the generated PDFs.
 

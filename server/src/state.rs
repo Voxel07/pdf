@@ -33,6 +33,10 @@ pub struct AppState {
     /// Write gate: mutating requests hold a read guard, backups take the write guard.
     pub gate: Arc<tokio::sync::RwLock<()>>,
     pub backup_running: Arc<tokio::sync::Mutex<()>>,
+    /// Progress of the current or last DocuSeal import (one at a time).
+    pub import: Arc<Mutex<crate::docuseal::ImportProgress>>,
+    /// Running and recently finished export jobs by id (see export_job.rs).
+    pub export_jobs: Arc<Mutex<HashMap<String, crate::export_job::ExportJob>>>,
 }
 
 impl AppState {
@@ -53,7 +57,7 @@ impl AppState {
                 sqlx::raw_sql(ddl).execute(&pool).await.with_context(|| format!("adding {table}.{column}"))?;
             }
         }
-        Ok(Self { pool, cfg: Arc::new(cfg), limiter: Default::default(), gate: Default::default(), backup_running: Default::default() })
+        Ok(Self { pool, cfg: Arc::new(cfg), limiter: Default::default(), gate: Default::default(), backup_running: Default::default(), import: Default::default(), export_jobs: Default::default() })
     }
 
     pub fn template_pdf_path(&self, template_id: &str) -> PathBuf {

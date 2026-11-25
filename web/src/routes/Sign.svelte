@@ -1,6 +1,7 @@
 <script lang="ts">
   import { request, ApiError, downloadBlob, type Field, type Section, fmtDate, fmtDateTime } from '../lib/api';
   import { loadPdf, type PdfDoc } from '../lib/pdf';
+  import PdfPreview from '../lib/PdfPreview.svelte';
   import PdfViewer from '../lib/PdfViewer.svelte';
   import SignaturePad from '../lib/SignaturePad.svelte';
   import { navigate } from '../lib/router.svelte';
@@ -195,17 +196,24 @@
   init();
 
   /** The session goes in a header, never in a URL (history, logs, referrers). */
+  async function fetchSigned(): Promise<{ blob: Blob; filename: string }> {
+    const res = await fetch(`${base}/signed.pdf`, { headers: { 'x-session': session } });
+    if (!res.ok) throw new Error(res.status === 401 ? 'Your session expired. Please enter your name again.' : `Download failed (${res.status})`);
+    const m = /filename="([^"]+)"/.exec(res.headers.get('content-disposition') ?? '');
+    return { blob: await res.blob(), filename: m?.[1] ?? 'signed.pdf' };
+  }
+
   async function downloadSigned() {
     error = '';
     try {
-      const res = await fetch(`${base}/signed.pdf`, { headers: { 'x-session': session } });
-      if (!res.ok) throw new Error(res.status === 401 ? 'Your session expired. Please enter your name again.' : `Download failed (${res.status})`);
-      const m = /filename="([^"]+)"/.exec(res.headers.get('content-disposition') ?? '');
-      await downloadBlob(await res.blob(), m?.[1] ?? 'signed.pdf');
+      const f = await fetchSigned();
+      await downloadBlob(f.blob, f.filename);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
   }
+
+  let previewing = $state(false);
 </script>
 
 <div class="sign-page">
@@ -284,7 +292,10 @@
             <button class="primary" style="width:100%;margin-top:8px" onclick={nextPerson}>Done — next person</button>
           {/if}
           {#if form.status !== 'pending'}
-            <button class="small" style="margin-top:8px" onclick={downloadSigned}>⬇ Download signed PDF</button>
+            <div class="row" style="margin-top:8px">
+              <button class="small" onclick={() => (previewing = true)}>👁 View signed PDF</button>
+              <button class="small" onclick={downloadSigned}>⬇ Download</button>
+            </div>
           {/if}
         </div>
 
@@ -370,9 +381,14 @@
   />
 {/if}
 
+
+{#if previewing}
+  <PdfPreview title="Signed document — {templateName || 'Document'}" load={fetchSigned} onclose={() => (previewing = false)} />
+{/if}
+
 <style>
   .sign-page { min-height: 100vh; }
-  header { background: white; border-bottom: 1px solid var(--border); padding: 12px 20px; }
+  header { background: var(--panel); border-bottom: 1px solid var(--border); padding: 12px 20px; }
   .brand { font-weight: 600; }
   .center { display: flex; justify-content: center; padding: 60px 16px; }
   .narrow { width: min(440px, 100%); }
@@ -400,7 +416,7 @@
   .sec-card.inactive { opacity: 0.8; }
   .fields { margin-top: 12px; }
   .req { color: var(--warn); }
-  .sign-btn { width: 100%; height: 64px; border-style: dashed; color: var(--accent); }
+  .sign-btn { width: 100%; height: 64px; border-style: dashed; color: var(--accent-text); }
   .sig-preview { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px; }
   .sig-preview img { height: 48px; flex: 1; object-fit: contain; object-position: left; }
   .auto-val { padding: 6px 0; }

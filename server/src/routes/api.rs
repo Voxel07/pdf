@@ -122,10 +122,14 @@ struct LinkReq {
 }
 
 /// Returns the signing link for a user (reusing an open or still valid document).
-async fn create_link(_c: ApiClient, State(st): State<AppState>, Json(req): Json<LinkReq>) -> AppResult<Json<Value>> {
+async fn create_link(c: ApiClient, State(st): State<AppState>, Json(req): Json<LinkReq>) -> AppResult<Json<Value>> {
     let t = get_template(&st.pool, &req.template).await?;
     let p = upsert_discord_person(&st.pool, &req.discord_id, req.name.as_deref(), req.username.as_deref(), req.zip.as_deref()).await?;
     let (sub, created) = find_or_create_submission(&st.pool, &t, &p, req.force_new, None).await?;
+    if created {
+        let actor = format!("bot: {}", c.key_name);
+        crate::activity::info(&st.pool, "api", Some(actor.as_str()), format!("signing link for '{}' created for {}", t.name, p.name)).await;
+    }
     let mut v = submission_json(&st, &sub, &t).await?;
     v["created"] = json!(created);
     Ok(Json(v))

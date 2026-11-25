@@ -8,6 +8,28 @@
   let name = $state('');
   let error = $state('');
   let uploading = $state(false);
+  // new template based on an existing one
+  let all = $state<Template[]>([]);
+  let baseId = $state('');
+  let copyName = $state('');
+  let copying = $state(false);
+  let copyError = $state('');
+  admin.get<Template[]>('/templates?archived=true').then((t) => (all = t));
+
+  async function copyTemplate(e: SubmitEvent) {
+    e.preventDefault();
+    if (!baseId) return;
+    copying = true;
+    copyError = '';
+    try {
+      const t = await admin.post<Template>(`/templates/${baseId}/duplicate`, { name: copyName || null });
+      navigate(`/admin/templates/${t.id}`);
+    } catch (err) {
+      copyError = err instanceof Error ? err.message : String(err);
+    } finally {
+      copying = false;
+    }
+  }
 
   async function load() {
     list = await admin.get(`/templates?archived=${showArchived}`);
@@ -46,6 +68,20 @@
     <button class="primary" type="submit" disabled={uploading || !file?.length}>{uploading ? 'Uploading…' : 'Upload & edit'}</button>
   </div>
   {#if error}<div class="error">{error}</div>{/if}
+</form>
+
+<form class="card" onsubmit={copyTemplate}>
+  <h2>New template based on an existing one</h2>
+  <p class="small muted">Copies the PDF, all fields, sections, description and validity — for example to start next year's form. Documents and general links are not copied.</p>
+  <div class="row">
+    <select bind:value={baseId} style="width:auto;max-width:320px" required aria-label="Template to copy">
+      <option value="">— template to copy —</option>
+      {#each all as t (t.id)}<option value={t.id}>{t.name}{t.archived ? ' (archived)' : ''}</option>{/each}
+    </select>
+    <input class="grow" placeholder={baseId ? `${all.find((t) => t.id === baseId)?.name ?? ''} (copy)` : 'Name of the new template'} bind:value={copyName} style="width:auto;flex:1" />
+    <button class="primary" type="submit" disabled={copying || !baseId}>{copying ? 'Copying…' : 'Copy & edit'}</button>
+  </div>
+  {#if copyError}<div class="error">{copyError}</div>{/if}
 </form>
 
 <div class="card">

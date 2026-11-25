@@ -127,3 +127,13 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Recent actions and errors shown in the admin UI (see activity.rs); pruned to the newest entries.
+CREATE TABLE IF NOT EXISTS activity_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    level      TEXT NOT NULL,          -- info | warn | error
+    category   TEXT NOT NULL,          -- import | export | backup | template | document | person | signing | api | server
+    actor      TEXT,
+    message    TEXT NOT NULL
+);

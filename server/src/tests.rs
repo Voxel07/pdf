@@ -281,3 +281,126 @@ async fn template_is_validated_as_a_whole() {
     // renaming a valid template still works
     assert_eq!(update_template(st, &t.id, up(serde_json::json!({ "name": "Kit" }))).await.unwrap().name, "Kit");
 }
+
+#[tokio::test]
+async fn duplicated_template_copies_layout_but_not_documents() {
+    let e = env().await;
+    let st = &e.st;
+    let t = template(st, 2).await;
+    let t = update_template(st, &t.id, serde_json::from_value(serde_json::json!({ "validity_days": 365, "description": "yearly" })).unwrap())
+        .await
+        .unwrap();
+    let p = create_person(&st.pool, "Gina Wolf", None, None).await.unwrap();
+    find_or_create_submission(&st.pool, &t, &p, false, None).await.unwrap();
+
+    let copy = duplicate_template(st, &t.id, Some("Equipment 2027")).await.unwrap();
+    assert_ne!(copy.id, t.id);
+    assert_eq!(copy.name, "Equipment 2027");
+    assert_eq!(copy.slug, "equipment-2027");
+    assert_eq!(copy.fields.len(), t.fields.len());
+    assert_eq!(copy.sections.len(), t.sections.len());
+    assert_eq!(copy.validity_days, Some(365));
+    assert_eq!(copy.description, "yearly");
+    assert_eq!(copy.source, None);
+    assert_eq!(copy.pdf_sha256, t.pdf_sha256);
+    assert!(st.template_pdf_path(&copy.id).is_file());
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM submissions WHERE template_id = ?").bind(&copy.id).fetch_one(&st.pool).await.unwrap();
+    assert_eq!(n, 0);
+    // without a name the copy is called "<name> (copy)"
+    assert_eq!(duplicate_template(st, &t.id, None).await.unwrap().name, format!("{} (copy)", t.name));
+}
+
+#[tokio::test]
+async fn export_can_be_limited_to_one_template() {
+    let e = env().await;
+    let st = &e.st;
+    let a = template(st, 0).await;
+    let b = template(st, 0).await;
+    for (t, name) in [(&a, "Hans Berg"), (&b, "Ida Busch"), (&b, "Jan Kurz")] {
+        let p = create_person(&st.pool, name, None, None).await.unwrap();
+        let (sub, _) = find_or_create_submission(&st.pool, t, &p, false, None).await.unwrap();
+        let h = session(st, &sub).await;
+        sign(st, &sub, t, &p, &h, &[("name", name)]).await.unwrap();
+    }
+    let all = export_all(st, &e.root.join("all"), None).await.unwrap();
+    assert_eq!(all.written, 3);
+    let one = export_all(st, &e.root.join("one"), Some(&b.slug)).await.unwrap();
+    assert_eq!(one.written, 2);
+    assert!(!e.root.join("one").join(&a.slug).exists());
+    assert_eq!(std::fs::read_dir(e.root.join("one").join(&b.slug)).unwrap().count(), 2);
+    assert!(export_all(st, &e.root.join("none"), Some("no-such-template")).await.is_err());
+}
+
+#[tokio::test]
+async fn activity_log_filters_by_level_and_pages() {
+    let e = env().await;
+    let st = &e.st;
+    crate::activity::info(&st.pool, "template", Some("alice"), "template 'A' saved").await;
+    crate::activity::warn(&st.pool, "import", Some("alice"), "submission 7: image missing").await;
+    crate::activity::error(&st.pool, "import", None, "submission 8: DocuSeal returned 500").await;
+    let list = |v: serde_json::Value| {
+        let f: crate::activity::Filter = serde_json::from_value(v).unwrap();
+        let pool = st.pool.clone();
+        async move { crate::activity::list(&pool, &f).await.unwrap() }
+    };
+    assert_eq!(list(serde_json::json!({})).await.len(), 3);
+    assert_eq!(list(serde_json::json!({ "level": "warn" })).await.len(), 2);
+    let errors = list(serde_json::json!({ "level": "error" })).await;
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].message.contains("500"));
+    assert_eq!(list(serde_json::json!({ "category": "template" })).await.len(), 1);
+    assert_eq!(list(serde_json::json!({ "q": "image" })).await.len(), 1);
+    // newest first, `before` continues with older entries
+    let first = list(serde_json::json!({ "limit": 2 })).await;
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].level, "error");
+    let rest = list(serde_json::json!({ "before": first[1].id })).await;
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].level, "info");
+}
+
+#[tokio::test]
+async fn export_jobs_report_progress_and_hand_out_the_zip_once() {
+    use crate::export_job::{self, Kind, StartRequest};
+    let e = env().await;
+    let st = &e.st;
+    let t = template(st, 0).await;
+    for name in ["Kai Lang", "Lea Roth"] {
+        let p = create_person(&st.pool, name, None, None).await.unwrap();
+        let (sub, _) = find_or_create_submission(&st.pool, &t, &p, false, None).await.unwrap();
+        let h = session(st, &sub).await;
+        sign(st, &sub, &t, &p, &h, &[("name", name)]).await.unwrap();
+    }
+    let wait = |id: String| async move {
+        for _ in 0..200 {
+            let j = export_job::get(st, &id).unwrap();
+            if !j.running {
+                return j;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("export did not finish");
+    };
+
+    let zip = export_job::start(st, StartRequest { kind: Kind::Zip, dir: None, template: Some(t.slug.clone()) }, "tester").await.unwrap();
+    let done = wait(zip.id.clone()).await;
+    assert_eq!((done.done, done.total), (2, 2));
+    assert_eq!(done.phase, "finished");
+    assert!(done.ready);
+    assert_eq!(done.report.as_ref().unwrap().written, 2);
+    let (name, bytes) = export_job::take_zip(st, &zip.id).unwrap();
+    assert!(name.starts_with(&format!("signatures-{}-", t.slug)));
+    assert!(zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap().len() >= 3);
+    assert!(export_job::take_zip(st, &zip.id).is_err(), "a ZIP is handed out once");
+    assert!(!export_job::get(st, &zip.id).unwrap().ready);
+
+    let dir = e.root.join("disk");
+    let disk = export_job::start(st, StartRequest { kind: Kind::Disk, dir: Some(dir.clone()), template: None }, "tester").await.unwrap();
+    let done = wait(disk.id).await;
+    assert_eq!(done.report.unwrap().written, 2);
+    assert!(dir.join("index.csv").is_file());
+
+    assert!(export_job::start(st, StartRequest { kind: Kind::Zip, dir: None, template: Some("missing".into()) }, "tester").await.is_err());
+    let (logged,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM activity_log WHERE category = 'export'").fetch_one(&st.pool).await.unwrap();
+    assert_eq!(logged, 2);
+}

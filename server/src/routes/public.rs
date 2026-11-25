@@ -70,6 +70,11 @@ async fn unlock(
         // slow down guessing a bit
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         let left = st.cfg.max_name_attempts - sub.failed_attempts - 1;
+        if left <= 0 {
+            let t = get_template(&st.pool, &sub.template_id).await?;
+            let msg = format!("signing link for '{}' of {} locked after too many wrong names", t.name, person.name);
+            crate::activity::warn(&st.pool, "signing", None, msg).await;
+        }
         return Err(AppError::new(
             StatusCode::FORBIDDEN,
             "wrong_name",
@@ -226,7 +231,12 @@ async fn submit(
         SubmitContext { signer_name: &person.name, ip: &ip, user_agent: &ua, session_hash: Some(&session_hash) },
     )
     .await?;
-    tracing::info!("submission {} signed by {}", sub.id, person.name);
+    let msg = if sub.completed_at.as_deref() == Some(sub.updated_at.as_str()) {
+        format!("{} signed '{}'", person.name, t.name)
+    } else {
+        format!("{} continued '{}'", person.name, t.name)
+    };
+    crate::activity::info(&st.pool, "signing", Some(ip.as_str()), msg).await;
     Ok(Json(build_form(&st, &sub).await?))
 }
 

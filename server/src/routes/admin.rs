@@ -9,9 +9,11 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::activity;
 use crate::auth::{create_api_key, AdminUser, Staff};
 use crate::backup;
 use crate::docuseal;
+use crate::export_job;
 use crate::models::*;
 use crate::pdf::{self, DrawItem, DrawValue};
 use crate::routes::public::pdf_response;
@@ -46,13 +48,18 @@ pub fn router() -> Router<AppState> {
         .route("/api-keys", get(api_keys).post(new_api_key))
         .route("/api-keys/{id}", delete(delete_api_key))
         .route("/docuseal/templates", post(docuseal_templates))
-        .route("/docuseal/import", post(docuseal_import))
+        .route("/docuseal/import", get(docuseal_import_status).post(docuseal_import))
+        .route("/activity", get(activity_list))
+        .route("/templates/{id}/duplicate", post(duplicate))
         .route("/backup", get(backup_overview))
         .route("/backup/config", axum::routing::put(backup_config))
         .route("/backup/run", post(backup_run))
         .route("/backup/files/{name}", get(backup_download).delete(backup_delete))
         .route("/export", post(export_disk))
         .route("/export.zip", get(export_zip))
+        .route("/export/jobs", post(export_job_start))
+        .route("/export/jobs/{id}", get(export_job_status))
+        .route("/export/jobs/{id}/download", get(export_job_download))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
 }
 
@@ -99,7 +106,7 @@ async fn templates(_u: Staff, State(st): State<AppState>, Query(q): Query<ListQu
     Ok(Json(json!(out)))
 }
 
-async fn upload_template(_u: Staff, State(st): State<AppState>, mut mp: Multipart) -> AppResult<Json<Template>> {
+async fn upload_template(Staff(u): Staff, State(st): State<AppState>, mut mp: Multipart) -> AppResult<Json<Template>> {
     let mut name = None;
     let mut pdf_bytes = None;
     while let Some(field) = mp.next_field().await.map_err(|e| AppError::bad_request(e.to_string()))? {
@@ -118,7 +125,23 @@ async fn upload_template(_u: Staff, State(st): State<AppState>, mut mp: Multipar
     }
     let pdf_bytes = pdf_bytes.ok_or_else(|| AppError::bad_request("missing file"))?;
     let name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Untitled".into());
-    Ok(Json(create_template(&st, name.trim(), &pdf_bytes, vec![], vec![], None).await?))
+    let t = create_template(&st, name.trim(), &pdf_bytes, vec![], vec![], None).await?;
+    activity::info(&st.pool, "template", Some(u.username.as_str()), format!("template '{}' uploaded ({} pages)", t.name, t.page_count)).await;
+    Ok(Json(t))
+}
+
+#[derive(Deserialize, Default)]
+struct DuplicateReq {
+    name: Option<String>,
+}
+
+/// New template based on an existing one (PDF, fields, sections and settings are copied).
+async fn duplicate(Staff(u): Staff, State(st): State<AppState>, Path(id): Path<String>, body: Option<Json<DuplicateReq>>) -> AppResult<Json<Template>> {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    let src = get_template(&st.pool, &id).await?;
+    let t = duplicate_template(&st, &src.id, req.name.as_deref()).await?;
+    activity::info(&st.pool, "template", Some(u.username.as_str()), format!("template '{}' created from '{}'", t.name, src.name)).await;
+    Ok(Json(t))
 }
 
 async fn template(_u: Staff, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Template>> {
@@ -126,23 +149,27 @@ async fn template(_u: Staff, State(st): State<AppState>, Path(id): Path<String>)
 }
 
 async fn update(
-    _u: Staff,
+    Staff(u): Staff,
     State(st): State<AppState>,
     Path(id): Path<String>,
     Json(up): Json<TemplateUpdate>,
 ) -> AppResult<Json<Template>> {
-    Ok(Json(update_template(&st, &id, up).await?))
+    let t = update_template(&st, &id, up).await?;
+    activity::info(&st.pool, "template", Some(u.username.as_str()), format!("template '{}' saved", t.name)).await;
+    Ok(Json(t))
 }
 
-async fn archive_template(_u: Staff, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
+async fn archive_template(Staff(u): Staff, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
     let t = get_template(&st.pool, &id).await?;
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM submissions WHERE template_id = ?").bind(&t.id).fetch_one(&st.pool).await?;
     if n == 0 {
         sqlx::query("DELETE FROM templates WHERE id = ?").bind(&t.id).execute(&st.pool).await?;
         let _ = tokio::fs::remove_file(st.template_pdf_path(&t.id)).await;
+        activity::info(&st.pool, "template", Some(u.username.as_str()), format!("template '{}' deleted", t.name)).await;
         Ok(Json(json!({ "deleted": true })))
     } else {
         sqlx::query("UPDATE templates SET archived = 1 WHERE id = ?").bind(&t.id).execute(&st.pool).await?;
+        activity::info(&st.pool, "template", Some(u.username.as_str()), format!("template '{}' archived ({n} documents kept)", t.name)).await;
         Ok(Json(json!({ "archived": true })))
     }
 }
@@ -324,10 +351,13 @@ struct CreateSubReq {
     force_new: bool,
 }
 
-async fn create_submission_admin(_u: Staff, State(st): State<AppState>, Json(req): Json<CreateSubReq>) -> AppResult<Json<Value>> {
+async fn create_submission_admin(Staff(u): Staff, State(st): State<AppState>, Json(req): Json<CreateSubReq>) -> AppResult<Json<Value>> {
     let t = get_template(&st.pool, &req.template_id).await?;
     let p = get_person(&st.pool, &req.person_id).await?;
     let (s, created) = find_or_create_submission(&st.pool, &t, &p, req.force_new, None).await?;
+    if created {
+        activity::info(&st.pool, "document", Some(u.username.as_str()), format!("signing link for '{}' created for {}", t.name, p.name)).await;
+    }
     let mut v = submission_json(&st, &s, &t).await?;
     v["created"] = json!(created);
     Ok(Json(v))
@@ -366,8 +396,25 @@ async fn submission_pdf(_u: Staff, State(st): State<AppState>, Path(id): Path<St
     Ok(pdf_response(bytes, &name, false))
 }
 
-async fn revoke(_u: Staff, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
+/// "'Template' of Person" for log messages.
+async fn describe_submission(st: &AppState, id: &str) -> String {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT t.name, p.name FROM submissions s JOIN templates t ON t.id = s.template_id JOIN persons p ON p.id = s.person_id WHERE s.id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await
+    .ok()
+    .flatten();
+    match row {
+        Some((t, p)) => format!("'{t}' of {p}"),
+        None => format!("document {id}"),
+    }
+}
+
+async fn revoke(Staff(u): Staff, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
     revoke_submission(&st.pool, &id).await?;
+    activity::info(&st.pool, "document", Some(u.username.as_str()), format!("{} revoked", describe_submission(&st, &id).await)).await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -376,14 +423,17 @@ async fn reset_lock(_u: Staff, State(st): State<AppState>, Path(id): Path<String
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn rotate_token(_u: Staff, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
+async fn rotate_token(Staff(u): Staff, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
     let s = rotate_submission_token(&st.pool, &id).await?;
+    activity::info(&st.pool, "document", Some(u.username.as_str()), format!("new signing link for {}", describe_submission(&st, &id).await)).await;
     let t = get_template(&st.pool, &s.template_id).await?;
     Ok(Json(submission_json(&st, &s, &t).await?))
 }
 
-async fn delete_submission(_u: AdminUser, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
+async fn delete_submission(AdminUser(u): AdminUser, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
+    let what = describe_submission(&st, &id).await;
     sqlx::query("DELETE FROM submissions WHERE id = ?").bind(&id).execute(&st.pool).await?;
+    activity::info(&st.pool, "document", Some(u.username.as_str()), format!("{what} deleted")).await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -433,7 +483,7 @@ struct PersonReq {
     notes: Option<String>,
 }
 
-async fn create_person_admin(_u: Staff, State(st): State<AppState>, Json(req): Json<PersonReq>) -> AppResult<Json<Person>> {
+async fn create_person_admin(Staff(u): Staff, State(st): State<AppState>, Json(req): Json<PersonReq>) -> AppResult<Json<Person>> {
     let p = create_person(&st.pool, &req.name, req.email.as_deref().filter(|e| !e.is_empty()), req.zip.as_deref()).await?;
     if let Some(d) = req.discord_id.as_deref().filter(|d| !d.is_empty()) {
         if let Err(e) = attach_discord(&st.pool, &p.id, d, None).await {
@@ -441,6 +491,7 @@ async fn create_person_admin(_u: Staff, State(st): State<AppState>, Json(req): J
             return Err(e);
         }
     }
+    activity::info(&st.pool, "person", Some(u.username.as_str()), format!("person {} created", p.name)).await;
     Ok(Json(p))
 }
 
@@ -458,8 +509,10 @@ async fn update_person(_u: Staff, State(st): State<AppState>, Path(id): Path<Str
     Ok(Json(get_person(&st.pool, &id).await?))
 }
 
-async fn delete_person(_u: AdminUser, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
+async fn delete_person(AdminUser(u): AdminUser, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
+    let p = get_person(&st.pool, &id).await?;
     sqlx::query("DELETE FROM persons WHERE id = ?").bind(&id).execute(&st.pool).await?;
+    activity::info(&st.pool, "person", Some(u.username.as_str()), format!("person {} and their documents deleted", p.name)).await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -492,8 +545,11 @@ struct MergeReq {
     into: String,
 }
 
-async fn merge(_u: Staff, State(st): State<AppState>, Json(req): Json<MergeReq>) -> AppResult<Json<Person>> {
-    Ok(Json(merge_persons(&st.pool, &req.from, &req.into).await?))
+async fn merge(Staff(u): Staff, State(st): State<AppState>, Json(req): Json<MergeReq>) -> AppResult<Json<Person>> {
+    let from = get_person(&st.pool, &req.from).await?;
+    let p = merge_persons(&st.pool, &req.from, &req.into).await?;
+    activity::info(&st.pool, "person", Some(u.username.as_str()), format!("person {} merged into {}", from.name, p.name)).await;
+    Ok(Json(p))
 }
 
 #[derive(Deserialize)]
@@ -502,8 +558,11 @@ struct LinkReq {
     new_discord_id: String,
 }
 
-async fn link_discord(_u: Staff, State(st): State<AppState>, Json(req): Json<LinkReq>) -> AppResult<Json<Person>> {
-    Ok(Json(link_discord_accounts(&st.pool, req.old_discord_id.trim(), req.new_discord_id.trim(), None).await?))
+async fn link_discord(Staff(u): Staff, State(st): State<AppState>, Json(req): Json<LinkReq>) -> AppResult<Json<Person>> {
+    let p = link_discord_accounts(&st.pool, req.old_discord_id.trim(), req.new_discord_id.trim(), None).await?;
+    let msg = format!("Discord account {} linked to {} (replaces {})", req.new_discord_id.trim(), p.name, req.old_discord_id.trim());
+    activity::info(&st.pool, "person", Some(u.username.as_str()), msg).await;
+    Ok(Json(p))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -528,11 +587,15 @@ struct KeyReq {
 
 async fn new_api_key(AdminUser(u): AdminUser, State(st): State<AppState>, Json(req): Json<KeyReq>) -> AppResult<Json<Value>> {
     let (id, key) = create_api_key(&st, req.name.trim(), Some(&u.id)).await?;
+    activity::info(&st.pool, "api", Some(u.username.as_str()), format!("API token '{}' created", req.name.trim())).await;
     Ok(Json(json!({ "id": id, "key": key })))
 }
 
-async fn delete_api_key(_u: AdminUser, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
+async fn delete_api_key(AdminUser(u): AdminUser, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
+    let name: Option<(String,)> = sqlx::query_as("SELECT name FROM api_keys WHERE id = ?").bind(&id).fetch_optional(&st.pool).await?;
     sqlx::query("DELETE FROM api_keys WHERE id = ?").bind(&id).execute(&st.pool).await?;
+    let name = name.map(|n| n.0).unwrap_or_else(|| id.clone());
+    activity::info(&st.pool, "api", Some(u.username.as_str()), format!("API token '{name}' revoked")).await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -544,9 +607,31 @@ async fn docuseal_templates(_u: AdminUser, Json(cfg): Json<docuseal::Connection>
     Ok(Json(json!(client.list_templates().await?)))
 }
 
-async fn docuseal_import(_u: AdminUser, State(st): State<AppState>, Json(req): Json<docuseal::ImportRequest>) -> AppResult<Json<Value>> {
-    let report = docuseal::import(&st, req).await?;
-    Ok(Json(json!(report)))
+/// Starts the import in the background; the UI then polls `GET /docuseal/import`.
+async fn docuseal_import(AdminUser(u): AdminUser, State(st): State<AppState>, Json(req): Json<docuseal::ImportRequest>) -> AppResult<Json<Value>> {
+    docuseal::start(&st, req, &u.username)?;
+    Ok(Json(json!(docuseal::progress(&st))))
+}
+
+async fn docuseal_import_status(_u: AdminUser, State(st): State<AppState>) -> Json<Value> {
+    Json(json!(docuseal::progress(&st)))
+}
+
+// ---------------------------------------------------------------------------------------
+// Activity log
+
+async fn activity_list(_u: Staff, State(st): State<AppState>, Query(f): Query<activity::Filter>) -> AppResult<Json<Value>> {
+    let entries = activity::list(&st.pool, &f).await?;
+    let (errors_24h,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM activity_log WHERE level = 'error' AND created_at >= ?")
+        .bind((chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .fetch_one(&st.pool)
+        .await?;
+    let categories: Vec<(String,)> = sqlx::query_as("SELECT DISTINCT category FROM activity_log ORDER BY category").fetch_all(&st.pool).await?;
+    Ok(Json(json!({
+        "entries": entries,
+        "errors_24h": errors_24h,
+        "categories": categories.into_iter().map(|c| c.0).collect::<Vec<_>>(),
+    })))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -555,17 +640,55 @@ async fn docuseal_import(_u: AdminUser, State(st): State<AppState>, Json(req): J
 #[derive(Deserialize, Default)]
 struct ExportReq {
     dir: Option<String>,
+    /// Only this template (id or slug); all templates when empty.
+    template_id: Option<String>,
 }
 
-async fn export_disk(_u: AdminUser, State(st): State<AppState>, body: Option<Json<ExportReq>>) -> AppResult<Json<Value>> {
+async fn log_export(st: &AppState, actor: &str, what: &str, r: &ExportReport) {
+    if r.failed.is_empty() {
+        activity::info(&st.pool, "export", Some(actor), format!("{what}: {} PDF(s) written", r.written)).await;
+    } else {
+        activity::error(
+            &st.pool,
+            "export",
+            Some(actor),
+            format!("{what}: {} PDF(s) written, {} failed: {}", r.written, r.failed.len(), r.failed.join("; ")),
+        )
+        .await;
+    }
+}
+
+async fn export_disk(AdminUser(u): AdminUser, State(st): State<AppState>, body: Option<Json<ExportReq>>) -> AppResult<Json<Value>> {
     let req = body.map(|b| b.0).unwrap_or_default();
     let dir = req.dir.filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from).unwrap_or_else(|| st.cfg.export_dir.clone());
-    Ok(Json(json!(export_all(&st, &dir).await?)))
+    let template = req.template_id.as_deref().filter(|t| !t.is_empty());
+    let template_name = match template {
+        Some(t) => Some(get_template(&st.pool, t).await?.name),
+        None => None,
+    };
+    let report = export_all(&st, &dir, template).await?;
+    let what = format!("export of {} to {}", template_name.map(|n| format!("'{n}'")).unwrap_or_else(|| "all templates".into()), report.dir);
+    log_export(&st, &u.username, &what, &report).await;
+    Ok(Json(json!(report)))
 }
 
-async fn export_zip(_u: Staff, State(st): State<AppState>) -> AppResult<Response> {
-    let (bytes, report) = service::export_zip(&st).await?;
-    let name = format!("signatures-{}.zip", chrono::Utc::now().format("%Y-%m-%d"));
+#[derive(Deserialize)]
+struct ZipQuery {
+    template_id: Option<String>,
+}
+
+async fn export_zip(Staff(u): Staff, State(st): State<AppState>, Query(q): Query<ZipQuery>) -> AppResult<Response> {
+    let template = match q.template_id.as_deref().filter(|t| !t.is_empty()) {
+        Some(t) => Some(get_template(&st.pool, t).await?),
+        None => None,
+    };
+    let (bytes, report) = service::export_zip(&st, template.as_ref().map(|t| t.id.as_str())).await?;
+    let what = format!("ZIP download of {}", template.as_ref().map(|t| format!("'{}'", t.name)).unwrap_or_else(|| "all templates".into()));
+    log_export(&st, &u.username, &what, &report).await;
+    let name = match &template {
+        Some(t) => format!("signatures-{}-{}.zip", t.slug, chrono::Utc::now().format("%Y-%m-%d")),
+        None => format!("signatures-{}.zip", chrono::Utc::now().format("%Y-%m-%d")),
+    };
     Ok((
         [
             (header::CONTENT_TYPE, "application/zip".to_string()),
@@ -574,6 +697,44 @@ async fn export_zip(_u: Staff, State(st): State<AppState>) -> AppResult<Response
             (header::HeaderName::from_static("x-export-failed"), report.failed.len().to_string()),
         ],
         bytes,
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+struct ExportJobReq {
+    kind: export_job::Kind,
+    dir: Option<String>,
+    template_id: Option<String>,
+}
+
+/// Starts a disk export (admin) or a ZIP build (staff) in the background; the UI polls the
+/// job for its progress bar and downloads a ZIP from `/export/jobs/{id}/download`.
+async fn export_job_start(Staff(u): Staff, State(st): State<AppState>, Json(req): Json<ExportJobReq>) -> AppResult<Json<Value>> {
+    if req.kind == export_job::Kind::Disk && !u.is_admin() {
+        return Err(AppError::new(axum::http::StatusCode::FORBIDDEN, "forbidden", "only admins can export to the server disk"));
+    }
+    let dir = req.dir.filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from);
+    let job = export_job::start(&st, export_job::StartRequest { kind: req.kind, dir, template: req.template_id }, &u.username).await?;
+    Ok(Json(json!(job)))
+}
+
+async fn export_job_status(_u: Staff, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
+    Ok(Json(json!(export_job::get(&st, &id)?)))
+}
+
+async fn export_job_download(_u: Staff, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Response> {
+    let job = export_job::get(&st, &id)?;
+    let (name, zip) = export_job::take_zip(&st, &id)?;
+    let failed = job.report.map(|r| r.failed.len()).unwrap_or(0);
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/zip".to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
+            (header::HeaderName::from_static("x-export-failed"), failed.to_string()),
+        ],
+        // the job no longer holds the archive, so this is the last reference
+        std::sync::Arc::try_unwrap(zip).unwrap_or_else(|z| (*z).clone()),
     )
         .into_response())
 }
