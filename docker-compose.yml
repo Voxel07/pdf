@@ -1,7 +1,7 @@
 services:
   pdfsign:
     build: .
-    # set PDFSIGN_IMAGE / PDFSIGN_TAG to use the images pushed by the GitLab CI
+    # Set PDFSIGN_IMAGE and PDFSIGN_TAG to use a GitHub Container Registry release.
     image: ${PDFSIGN_IMAGE:-pdfsign}:${PDFSIGN_TAG:-latest}
     restart: unless-stopped
     env_file: .env

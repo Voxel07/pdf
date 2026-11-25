@@ -14,7 +14,7 @@ pdfsign is a self-hosted PDF signing app for Discord communities. Start with [RE
 | Admin UI and shared client types | [web/src/routes/admin/AdminApp.svelte](web/src/routes/admin/AdminApp.svelte) | [TemplateEditor.svelte](web/src/routes/admin/TemplateEditor.svelte), [GeneralLinks.svelte](web/src/routes/admin/GeneralLinks.svelte), and [web/src/lib/api.ts](web/src/lib/api.ts) |
 | Backup, restore, and DocuSeal import | [server/src/backup.rs](server/src/backup.rs) and [docuseal.rs](server/src/docuseal.rs) | [Backups.svelte](web/src/routes/admin/Backups.svelte) and [Import.svelte](web/src/routes/admin/Import.svelte) |
 | Discord commands and events | [bot/src/index.ts](bot/src/index.ts) | [commands.ts](bot/src/commands.ts) defines slash commands, [api.ts](bot/src/api.ts) is the bearer client, [config.ts](bot/src/config.ts) reads env, and [register.ts](bot/src/register.ts) registers commands manually |
-| Build and deployment | [docker-compose.yml](docker-compose.yml), [Dockerfile](Dockerfile), and [bot/Dockerfile](bot/Dockerfile) | [.env.example](.env.example), [.gitlab-ci.yml](.gitlab-ci.yml), [renovate.json](renovate.json), and [scripts/docker-cargo.sh](scripts/docker-cargo.sh) |
+| Build and deployment | [docker-compose.yml](docker-compose.yml), [Dockerfile](Dockerfile), and [bot/Dockerfile](bot/Dockerfile) | [.env.example](.env.example), [GitHub Actions workflow](.github/workflows/ci.yml), [renovate.json](renovate.json), and [scripts/docker-cargo.sh](scripts/docker-cargo.sh) |
 
 ## Follow the data
 
@@ -27,7 +27,7 @@ pdfsign is a self-hosted PDF signing app for Discord communities. Start with [RE
 
 ## Local checks
 
-Run these from the repository root. GitLab runs the same checks with the versions pinned in [.gitlab-ci.yml](.gitlab-ci.yml).
+Run these from the repository root. GitHub Actions runs the same checks with the versions pinned in [the workflow](.github/workflows/ci.yml).
 
 ```bash
 (cd server && cargo test --locked)

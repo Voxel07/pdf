@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Weekly dependency updates, collected into a single merge request.",
+  "description": "Group non-major dependency updates into a weekly pull request.",
   "extends": [
     "config:recommended",
     "schedule:weekly",
@@ -24,7 +24,7 @@
       "minimumReleaseAge": "3 days"
     },
     {
-      "description": "Major updates can break things: they are listed on the Dependency Dashboard and only get an MR when ticked there",
+      "description": "Major updates require approval on the Dependency Dashboard before Renovate opens a pull request",
       "matchUpdateTypes": ["major"],
       "dependencyDashboardApproval": true
     },
@@ -45,9 +45,9 @@
       ]
     },
     {
-      "description": "BuildKit image used by 'docker buildx create' in the GitLab CI",
+      "description": "BuildKit image used by 'docker buildx create' in GitHub Actions",
       "customType": "regex",
-      "managerFilePatterns": ["/^\\.gitlab-ci\\.yml$/"],
+      "managerFilePatterns": [".github/workflows/ci.yml"],
       "matchStrings": ["--driver-opt image=(?<depName>[^:\\s]+):(?<currentValue>\\S+)"],
       "datasourceTemplate": "docker"
     }

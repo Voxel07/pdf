@@ -30,6 +30,17 @@ docker compose up -d --build pdfsign
 
 Put a TLS reverse proxy in front of port 8080 and set `PUBLIC_URL` to the public HTTPS URL. Session cookies are marked `Secure` when `PUBLIC_URL` starts with `https://`. The proxy must set `X-Forwarded-For`. The header is only believed from addresses in `TRUSTED_PROXIES` (default: loopback and private networks, which covers a proxy on the host or in Docker).
 
+### Prebuilt images
+
+GitHub Actions runs checks on pull requests and release tags such as `0.5.3`. To publish a release, push a numeric `major.minor.patch` tag on a commit containing [the workflow](.github/workflows/ci.yml). After the checks pass, GitHub Actions pushes `ghcr.io/voxel07/pdf` and `ghcr.io/voxel07/pdf-bot` with the full version, `major.minor`, and `latest` tags.
+
+Set `PDFSIGN_IMAGE`, `PDFSIGN_BOT_IMAGE`, and `PDFSIGN_TAG` in `.env` using the examples in [.env.example](.env.example). For private packages, authenticate Docker to `ghcr.io` with a token that has package read access. [GitHub Container Registry authentication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-to-the-container-registry)
+
+```bash
+docker compose pull pdfsign bot
+docker compose up -d --no-build pdfsign bot
+```
+
 ### 1. authentik
 
 1. **Applications → Providers → Create → OAuth2/OpenID Provider**

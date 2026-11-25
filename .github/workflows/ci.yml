@@ -1,0 +1,100 @@
+name: CI and container images
+
+on:
+  pull_request:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+jobs:
+  test-server:
+    runs-on: ubuntu-latest
+    container: rust:1.100.0-slim-trixie
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run Rust tests
+        working-directory: server
+        run: cargo test --locked
+
+  test-web:
+    runs-on: ubuntu-latest
+    container: oven/bun:1.4.5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check and build the web app
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run check --fail-on-warnings
+          bun run build
+
+  test-bot:
+    runs-on: ubuntu-latest
+    container: oven/bun:1.4.5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Type-check the bot
+        working-directory: bot
+        run: |
+          bun install --frozen-lockfile
+          bun run check
+
+  publish:
+    name: Publish ${{ matrix.component }}
+    if: github.event_name == 'push' && github.ref_type == 'tag' && !github.event.deleted
+    needs: [test-server, test-web, test-bot]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: app
+            context: .
+            suffix: ''
+          - component: bot
+            context: bot
+            suffix: -bot
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        run: docker buildx create --use --driver docker-container --driver-opt image=moby/buildkit:v0.35.1
+      - name: Log in to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Build and push image
+        shell: bash
+        env:
+          BUILD_CONTEXT: ${{ matrix.context }}
+          IMAGE_SUFFIX: ${{ matrix.suffix }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}${IMAGE_SUFFIX}"
+          version="$GITHUB_REF_NAME"
+          minor="${version%.*}"
+
+          docker buildx build --push \
+            --build-arg "VERSION=$version" \
+            --label "org.opencontainers.image.version=$version" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --cache-from "type=registry,ref=$image:buildcache" \
+            --cache-to "type=registry,ref=$image:buildcache,mode=max" \
+            --tag "$image:$version" \
+            --tag "$image:$minor" \
+            --tag "$image:latest" \
+            "$BUILD_CONTEXT"
