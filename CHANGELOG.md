@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - pdfsign and DIY Calendar can be installed as standalone web apps on iPhone, Android, and desktop Chrome.
+- Releases publish a calendar image, `ghcr.io/voxel07/pdf-calendar`. Set `PDFSIGN_CALENDAR_IMAGE` to use it with Docker Compose. A locally built calendar image is now tagged `pdfsign-calendar`.
 
 ## [0.0.4] - 2026-11-26
 

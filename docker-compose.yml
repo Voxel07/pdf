@@ -46,6 +46,7 @@ services:
       file: calendar/docker-compose.yml
       service: calendar
     build: ./calendar
+    image: ${PDFSIGN_CALENDAR_IMAGE:-pdfsign-calendar}:${PDFSIGN_TAG:-latest}
 
 volumes:
   calendar-data:

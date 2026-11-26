@@ -37,6 +37,7 @@ Run these from the repository root. GitHub Actions runs the same checks with the
 
 ```bash
 (cd server && cargo test --locked)
+(cd calendar && bun install --frozen-lockfile)  # web imports calendar/src/lib
 (cd web && bun install --frozen-lockfile && bun run check --fail-on-warnings && bun run build)
 (cd bot && bun install --frozen-lockfile && bun run check)
 ```

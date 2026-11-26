@@ -28,6 +28,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The admin Events page imports calendar/src/lib, and Vite resolves those files against
+      # calendar/tsconfig.json, which extends @tsconfig/svelte from calendar/node_modules.
+      - name: Install calendar dependencies
+        working-directory: calendar
+        run: bun install --frozen-lockfile
       - name: Check and build the web app
         working-directory: web
         run: |
@@ -48,6 +53,21 @@ jobs:
           bun install --frozen-lockfile
           bun run check
 
+  test-calendar:
+    runs-on: ubuntu-latest
+    container: oven/bun:1.4.5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check, test and build the calendar
+        working-directory: calendar
+        run: |
+          bun install --frozen-lockfile
+          bun run check
+          bun test
+          bun run build
+
   # Known-vulnerability check of the locked dependencies. Not required for publishing, so a
   # newly published advisory flags pull requests without blocking an urgent release.
   audit:
@@ -61,15 +81,15 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit
-      - name: Audit web and bot dependencies
+      - name: Audit web, bot and calendar dependencies
         run: |
           curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.5"
-          for dir in web bot; do (cd "$dir" && ~/.bun/bin/bun audit); done
+          for dir in web bot calendar; do (cd "$dir" && ~/.bun/bin/bun audit); done
 
   publish:
     name: Publish ${{ matrix.component }}
     if: github.event_name == 'push' && github.ref_type == 'tag' && !github.event.deleted
-    needs: [test-server, test-web, test-bot]
+    needs: [test-server, test-web, test-bot, test-calendar]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -84,6 +104,9 @@ jobs:
           - component: bot
             context: bot
             suffix: -bot
+          - component: calendar
+            context: calendar
+            suffix: -calendar
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -47,13 +47,16 @@ The app opens the admin entry point. To sign a document, open the signing link y
 
 ### Prebuilt images
 
-GitHub Actions runs checks on pull requests and release tags such as `0.5.3`. To publish a release, push a numeric `major.minor.patch` tag on a commit containing [the workflow](.github/workflows/ci.yml). After the checks pass, GitHub Actions pushes `ghcr.io/voxel07/pdf` and `ghcr.io/voxel07/pdf-bot` with the full version, `major.minor`, and `latest` tags.
+GitHub Actions runs checks on pull requests and release tags such as `0.5.3`. To publish a release, push a numeric `major.minor.patch` tag on a commit containing [the workflow](.github/workflows/ci.yml). After the checks pass, GitHub Actions pushes `ghcr.io/voxel07/pdf`, `ghcr.io/voxel07/pdf-bot`, and `ghcr.io/voxel07/pdf-calendar` with the full version, `major.minor`, and `latest` tags.
 
-Set `PDFSIGN_IMAGE`, `PDFSIGN_BOT_IMAGE`, and `PDFSIGN_TAG` in `.env` using the examples in [.env.example](.env.example). For private packages, authenticate Docker to `ghcr.io` with a token that has package read access. [GitHub Container Registry authentication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-to-the-container-registry)
+Set `PDFSIGN_IMAGE`, `PDFSIGN_BOT_IMAGE`, `PDFSIGN_CALENDAR_IMAGE`, and `PDFSIGN_TAG` in `.env` using the examples in [.env.example](.env.example). For private packages, authenticate Docker to `ghcr.io` with a token that has package read access. [GitHub Container Registry authentication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-to-the-container-registry)
 
 ```bash
 docker compose pull pdfsign bot
 docker compose up -d --no-build pdfsign bot
+# with events enabled
+docker compose --profile calendar pull calendar
+docker compose --profile calendar up -d --no-build calendar
 ```
 
 ### 1. authentik
