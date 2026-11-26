@@ -44,6 +44,77 @@ fn text_field(id: &str, section: u32, y: f64) -> Field {
     }
 }
 
+#[tokio::test]
+async fn admin_deletion_scopes_and_permissions() {
+    let e = env().await;
+    let st = &e.st;
+    let t = template(st, 0).await;
+    let other = template(st, 0).await;
+    let p = create_person(&st.pool, "Signer", None, None).await.unwrap();
+    let (first, _) = find_or_create_submission(&st.pool, &t, &p, true, None).await.unwrap();
+    let (second, _) = find_or_create_submission(&st.pool, &t, &p, true, None).await.unwrap();
+    let (third, _) = find_or_create_submission(&st.pool, &other, &p, true, None).await.unwrap();
+    for sub in [&first, &second] {
+        let h = session(st, sub).await;
+        sign(st, sub, &t, &p, &h, &[("name", "Signer")]).await.unwrap();
+    }
+    for role in ["staff", "admin"] {
+        sqlx::query("INSERT INTO users (id, sub, username, role, created_at, last_login_at) VALUES (?, ?, ?, ?, '', '')")
+            .bind(role).bind(role).bind(role).bind(role).execute(&st.pool).await.unwrap();
+        sqlx::query("INSERT INTO user_sessions VALUES (?, ?, '9999-01-01')").bind(sha256_hex(role)).bind(role).execute(&st.pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO public_links (id, template_id, token, created_at) VALUES ('qr', ?, 'link', '')")
+        .bind(&t.id).execute(&st.pool).await.unwrap();
+    let app = axum::Router::new().nest("/api/admin", crate::routes::admin::router())
+        .layer(axum::middleware::from_fn_with_state(st.clone(), crate::backup::write_gate)).with_state(st.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/api/admin", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let delete = |path: &str, role: &str| client.delete(format!("{base}/{path}")).header("cookie", format!("pdfsign_session={role}"));
+    let submission = format!("submissions/{}", first.id);
+    let permanent = format!("templates/{}/permanent", t.id);
+    let confirm = serde_json::json!({ "confirmation": "DELETE ALL DATA" });
+    for path in [submission.as_str(), permanent.as_str(), "data"] {
+        assert_eq!(delete(path, "staff").json(&confirm).send().await.unwrap().status(), 403);
+    }
+    assert_eq!(delete("data", "admin").json(&serde_json::json!({"confirmation": "no"})).send().await.unwrap().status(), 400);
+    assert_eq!(delete(&submission, "admin").send().await.unwrap().status(), 200);
+    assert!(load_values(&st.pool, &first.id).await.unwrap().is_empty());
+    assert!(load_rounds(&st.pool, &first.id).await.unwrap().is_empty());
+    assert!(submission_by_token(&st.pool, &first.token).await.is_err());
+    assert!(get_submission(&st.pool, &second.id).await.is_ok());
+
+    assert_eq!(delete(&format!("templates/{}", t.id), "staff").send().await.unwrap().status(), 200);
+    assert!(get_template(&st.pool, &t.id).await.unwrap().archived);
+    assert!(st.template_pdf_path(&t.id).exists());
+    assert_eq!(delete(&permanent, "admin").send().await.unwrap().status(), 200);
+    assert!(!st.template_pdf_path(&t.id).exists());
+    assert!(get_submission(&st.pool, &second.id).await.is_err());
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM public_links").fetch_one(&st.pool).await.unwrap(), 0);
+    assert!(get_submission(&st.pool, &third.id).await.is_ok());
+    assert!(st.template_pdf_path(&other.id).exists());
+
+    crate::auth::create_api_key(st, "bot", None).await.unwrap();
+    sqlx::query("INSERT INTO settings VALUES ('test', 'data')").execute(&st.pool).await.unwrap();
+    st.import.lock().unwrap().running = true;
+    assert_eq!(delete("data", "admin").json(&confirm).send().await.unwrap().status(), 409);
+    st.import.lock().unwrap().running = false;
+    let orphan = st.template_pdf_path(&new_id());
+    std::fs::write(&orphan, b"previous upload").unwrap();
+    assert_eq!(delete("data", "admin").json(&confirm).send().await.unwrap().status(), 200);
+    assert!(!orphan.exists());
+    assert!(!st.template_pdf_path(&other.id).exists());
+    assert_eq!(delete("data", "admin").json(&confirm).send().await.unwrap().status(), 401);
+    for count in ["SELECT count(*) FROM users", "SELECT count(*) FROM templates", "SELECT count(*) FROM submissions",
+                  "SELECT count(*) FROM persons", "SELECT count(*) FROM api_keys", "SELECT count(*) FROM settings",
+                  "SELECT count(*) FROM activity_log", "SELECT count(*) FROM signer_sessions", "SELECT count(*) FROM deleted_template_pdfs"] {
+        assert_eq!(sqlx::query_scalar::<_, i64>(count).fetch_one(&st.pool).await.unwrap(), 0, "{count}");
+    }
+    assert!(template(st, 0).await.id != other.id);
+    server.abort();
+}
+
 /// A recipient section (required) plus `rows` optional rows, one text field each.
 async fn template(st: &AppState, rows: u32) -> Template {
     let mut sections = vec![Section { id: 0, name: "Recipient".into(), required: true }];
@@ -53,6 +124,76 @@ async fn template(st: &AppState, rows: u32) -> Template {
         fields.push(text_field(&format!("item{r}"), r, 0.05 + r as f64 * 0.05));
     }
     create_template(st, "Equipment", &crate::pdf::tests::blank_pdf(), fields, sections, None).await.unwrap()
+}
+
+#[tokio::test]
+async fn people_pages_and_group_requirements_use_person_identity() {
+    use reqwest::Method;
+    use serde_json::{json, Value};
+    let e = env().await;
+    let st = &e.st;
+    let t = template(st, 0).await;
+    sqlx::query("UPDATE templates SET validity_days = 30 WHERE id = ?").bind(&t.id).execute(&st.pool).await.unwrap();
+    // Identical names and update times exercise both pagination tie-breakers.
+    sqlx::raw_sql("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<106)
+        INSERT INTO persons (id, name, created_at) SELECT printf('p%03d',i), 'Alex Lee', '' FROM n;")
+        .execute(&st.pool).await.unwrap();
+    sqlx::query("INSERT INTO submissions (id, token, template_id, person_id, status, created_at, updated_at)
+        SELECT id, id, ?, id, 'pending', '', '' FROM persons WHERE id != 'p001'")
+        .bind(&t.id).execute(&st.pool).await.unwrap();
+    sqlx::query("UPDATE submissions SET status = 'completed', completed_at = ? WHERE id = 'p002'")
+        .bind(now()).execute(&st.pool).await.unwrap();
+    sqlx::raw_sql("UPDATE submissions SET status = 'completed', completed_at = '2001-01-01T00:00:00Z' WHERE id = 'p003';
+        UPDATE submissions SET status = 'revoked' WHERE id = 'p004';
+        INSERT INTO users (id, sub, username, role, created_at, last_login_at) VALUES ('tester','tester','tester','staff','','');")
+        .execute(&st.pool).await.unwrap();
+    sqlx::query("INSERT INTO user_sessions VALUES (?, 'tester', '9999-01-01')").bind(sha256_hex("test-session")).execute(&st.pool).await.unwrap();
+    let app = crate::routes::admin::router().with_state(st.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let send = |method: Method, path: String, body: Value| {
+        let req = client.request(method, format!("{base}/{path}")).header("cookie", "pdfsign_session=test-session").json(&body);
+        async move { req.send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap() }
+    };
+    for (path, key, expected) in [("persons", "name", 106), ("submissions", "updated_at", 105)] {
+        let mut cursor = String::new();
+        let mut seen = std::collections::HashSet::new();
+        for expected_size in [50, 50, expected - 100] {
+            let result = send(Method::GET, format!("{path}?limit=50{cursor}"), Value::Null).await;
+            let batch = result.as_array().unwrap();
+            assert_eq!(batch.len(), expected_size);
+            for item in batch { assert!(seen.insert(item["id"].as_str().unwrap().to_owned())); }
+            let last = batch.last().unwrap();
+            cursor = format!("&after_key={}&after_id={}", last[key].as_str().unwrap(), last["id"].as_str().unwrap());
+        }
+    }
+    let group = send(Method::POST, "groups".into(), json!({"name":"Crew"})).await;
+    let group_id = group["id"].as_str().unwrap();
+    for person in ["p001", "p002", "p003", "p004", "p005", "p005"] {
+        send(Method::PUT, format!("groups/{group_id}/members/{person}"), Value::Null).await;
+    }
+    let report = format!("groups/{group_id}/requirements");
+    let required = format!("{report}/{}", t.id);
+    send(Method::PUT, required.clone(), Value::Null).await;
+    let result = send(Method::GET, report.clone(), Value::Null).await;
+    let missing: Vec<_> = result[0]["missing"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(missing, ["p001", "p003", "p004", "p005"]); // absent, expired, revoked, pending
+    let reasons: Vec<_> = result[0]["missing"].as_array().unwrap().iter().map(|p| p["status"].as_str().unwrap()).collect();
+    assert_eq!(reasons, ["unissued", "expired", "revoked", "pending"]);
+    let scoped = send(Method::GET, "submissions?person_id=p003&status=expired&limit=50".into(), Value::Null).await;
+    assert_eq!(scoped.as_array().unwrap().len(), 1);
+    assert_eq!(scoped[0]["person_id"], "p003");
+    assert_eq!(scoped[0]["status"], "expired");
+    send(Method::DELETE, format!("groups/{group_id}/members/p005"), Value::Null).await;
+    merge_persons(&st.pool, "p001", "p006").await.unwrap();
+    let result = send(Method::GET, report.clone(), Value::Null).await;
+    let missing: Vec<_> = result[0]["missing"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(missing, ["p003", "p004", "p006"]);
+    send(Method::DELETE, required, Value::Null).await;
+    assert_eq!(send(Method::GET, report, Value::Null).await, json!([]));
+    server.abort();
 }
 
 async fn session(st: &AppState, sub: &Submission) -> String {

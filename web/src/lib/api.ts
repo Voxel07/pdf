@@ -51,7 +51,7 @@ export const admin = {
   get: <T = any>(path: string) => adminReq<T>('GET', path),
   post: <T = any>(path: string, body?: unknown) => adminReq<T>('POST', path, body ?? {}),
   put: <T = any>(path: string, body: unknown) => adminReq<T>('PUT', path, body),
-  del: <T = any>(path: string) => adminReq<T>('DELETE', path),
+  del: <T = any>(path: string, body?: unknown) => adminReq<T>('DELETE', path, body),
   blob: (path: string) => adminReq<Blob>('GET', path),
   headers: (): Record<string, string> => ({}),
 };
@@ -175,6 +175,11 @@ export interface ActivityEntry {
   category: string;
   actor: string | null;
   message: string;
+}
+
+export interface PersonGroup {
+  id: string;
+  name: string;
 }
 
 export const fmtDate =(s?: string | null) => (s ? new Date(s).toLocaleDateString() : '—');

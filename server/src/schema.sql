@@ -25,6 +25,29 @@ CREATE TABLE IF NOT EXISTS persons (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS person_groups (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE
+);
+CREATE TABLE IF NOT EXISTS group_members (
+    person_id TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+    group_id TEXT NOT NULL REFERENCES person_groups(id) ON DELETE CASCADE,
+    PRIMARY KEY (person_id, group_id)
+);
+CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_id, person_id);
+CREATE TABLE IF NOT EXISTS group_requirements (
+    group_id TEXT NOT NULL REFERENCES person_groups(id) ON DELETE CASCADE,
+    template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+    PRIMARY KEY (group_id, template_id)
+);
+CREATE INDEX IF NOT EXISTS idx_persons_name ON persons(name COLLATE NOCASE, id);
+
+-- Keep PDF cleanup retryable if the process stops after committing a deletion.
+CREATE TABLE IF NOT EXISTS deleted_template_pdfs (id TEXT PRIMARY KEY);
+CREATE TRIGGER IF NOT EXISTS queue_deleted_template_pdf AFTER DELETE ON templates BEGIN
+    INSERT OR IGNORE INTO deleted_template_pdfs (id) VALUES (OLD.id);
+END;
+
 CREATE TABLE IF NOT EXISTS discord_accounts (
     discord_id TEXT PRIMARY KEY,
     person_id  TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
@@ -46,6 +69,14 @@ CREATE TABLE IF NOT EXISTS submissions (
     completed_at    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sub_person ON submissions(person_id, template_id);
+CREATE INDEX IF NOT EXISTS idx_sub_updated ON submissions(updated_at DESC, id DESC);
+
+-- Match service::validity, including legacy completions with no timestamp.
+CREATE VIEW IF NOT EXISTS document_status AS
+SELECT s.*, CASE WHEN s.status = 'completed'
+    AND julianday(s.completed_at) + t.validity_days <= julianday('now')
+    THEN 'expired' ELSE s.status END AS effective_status
+FROM submissions s JOIN templates t ON t.id = s.template_id;
 
 -- One row per filled field. Signatures are stored as small PNGs.
 CREATE TABLE IF NOT EXISTS field_values (

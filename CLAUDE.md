@@ -13,7 +13,7 @@ pdfsign is a self-hosted PDF signing app for Discord communities. Start with [RE
 | Public signing UI | [web/src/App.svelte](web/src/App.svelte) | [Sign.svelte](web/src/routes/Sign.svelte) for `/s/:token`, [PublicLink.svelte](web/src/routes/PublicLink.svelte) for `/p/:token`, and [SignaturePad.svelte](web/src/lib/SignaturePad.svelte) for drawing |
 | Admin UI and shared client types | [web/src/routes/admin/AdminApp.svelte](web/src/routes/admin/AdminApp.svelte) | [TemplateEditor.svelte](web/src/routes/admin/TemplateEditor.svelte), [GeneralLinks.svelte](web/src/routes/admin/GeneralLinks.svelte), and [web/src/lib/api.ts](web/src/lib/api.ts) |
 | Backup, restore, and DocuSeal import | [server/src/backup.rs](server/src/backup.rs) and [docuseal.rs](server/src/docuseal.rs) | [Backups.svelte](web/src/routes/admin/Backups.svelte) and [Import.svelte](web/src/routes/admin/Import.svelte) |
-| Discord commands and events | [bot/src/index.ts](bot/src/index.ts) | [commands.ts](bot/src/commands.ts) defines slash commands, [api.ts](bot/src/api.ts) is the bearer client, [config.ts](bot/src/config.ts) reads env, and [register.ts](bot/src/register.ts) registers commands manually |
+| Discord commands and events | [bot/src/index.ts](bot/src/index.ts) | [commands.ts](bot/src/commands.ts) defines the help menu and names of legacy commands, [api.ts](bot/src/api.ts) is the bearer client, and [config.ts](bot/src/config.ts) reads env |
 | Build and deployment | [docker-compose.yml](docker-compose.yml), [Dockerfile](Dockerfile), and [bot/Dockerfile](bot/Dockerfile) | [.env.example](.env.example), [GitHub Actions workflow](.github/workflows/ci.yml), [renovate.json](renovate.json), and [scripts/docker-cargo.sh](scripts/docker-cargo.sh) |
 
 ## Follow the data
@@ -24,6 +24,12 @@ pdfsign is a self-hosted PDF signing app for Discord communities. Start with [RE
 - Field positions are fractions of the displayed page, with a top-left origin and zero-based page indices. Keep `models.rs`, `web/src/lib/api.ts`, the editor, and `pdf.rs` aligned when changing field shape, coordinates, or formatting.
 - Values and signature PNGs are stored with their signing round. Downloads and exports currently rebuild PDFs from the live template and stored values. Read the record-integrity items in [PLAN.md](PLAN.md) before changing template editing, validity, or audit behavior.
 - Backups include SQLite and template PDFs. Rendered exports and optional DocuSeal originals live under `EXPORT_DIR`. Use temporary `DATA_DIR`, `EXPORT_DIR`, and `BACKUP_DIR` for local checks. Restore only with the server stopped and use a fresh destination for test restores.
+
+## Discord commands
+
+- Use the `!` prefix for bot commands. Route unknown `!` commands to the same menu as `!help`, and list staff commands only for users with staff access.
+- Keep registration details in the private form and send personal details and signing links by DM. Preserve the staff permission check when adding staff commands.
+- When changing bot commands, update the help menu and [README.md](README.md) together. Record user-facing changes and upgrade requirements under **Unreleased** in [CHANGELOG.md](CHANGELOG.md).
 
 ## Local checks
 

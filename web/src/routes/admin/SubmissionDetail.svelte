@@ -8,6 +8,7 @@
   let s = $state<any>(null);
   let error = $state('');
   let previewing = $state(false);
+  let deleting = $state(false);
 
   async function load() {
     try {
@@ -25,9 +26,17 @@
   }
 
   async function remove() {
-    if (!confirm('Permanently delete this document and all its signatures?')) return;
-    await admin.del(`/submissions/${id}`);
-    navigate('/admin/submissions');
+    if (deleting || !confirm(`Permanently delete the "${s.template_name}" submission for ${s.person_name}, including its values, signatures, signing link, and audit trail?`)) return;
+    deleting = true;
+    error = '';
+    try {
+      await admin.del(`/submissions/${id}`);
+      navigate('/admin/submissions');
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    } finally {
+      deleting = false;
+    }
   }
 
   const sectionName = (sid: number) => s?.sections.find((x: any) => x.id === sid)?.name ?? `#${sid}`;
@@ -63,7 +72,7 @@
       {#if s.locked}<button onclick={() => act('reset-lock')}>Unlock link</button>{/if}
       <button onclick={() => act('rotate-token', 'Generate a new link? The old link stops working.')}>New link</button>
       {#if s.status !== 'revoked'}<button class="danger" onclick={() => act('revoke', 'Revoke this document? It will no longer count as valid.')}>Revoke</button>{/if}
-      {#if isAdmin()}<button class="danger" onclick={remove}>Delete</button>{/if}
+      {#if isAdmin()}<button class="danger" onclick={remove} disabled={deleting}>{deleting ? 'Deleting…' : 'Delete submission'}</button>{/if}
     </div>
   </div>
 

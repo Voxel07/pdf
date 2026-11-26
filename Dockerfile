@@ -19,7 +19,10 @@ RUN touch src/main.rs && cargo build --release --locked
 FROM debian:13.8-slim
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="pdfsign" org.opencontainers.image.version="${VERSION}"
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates tzdata \
+      libzstd1=1.5.7+dfsg-1+deb13u1 \
+      zlib1g=1:1.3.dfsg+really1.3.1-1+deb13u1 \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /data /export /backups && chmod 777 /data /export /backups
 COPY --from=server /src/target/release/pdfsign /usr/local/bin/pdfsign

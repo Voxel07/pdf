@@ -7,6 +7,23 @@
   let users = $state<any[]>([]);
   let keyName = $state('discord-bot');
   let newKey = $state('');
+  let confirmation = $state('');
+  let resetting = $state(false);
+  let resetError = $state('');
+
+  async function resetData(e: SubmitEvent) {
+    e.preventDefault();
+    if (confirmation !== 'DELETE ALL DATA' || resetting) return;
+    resetting = true;
+    resetError = '';
+    try {
+      await admin.del('/data', { confirmation });
+      location.replace('/admin');
+    } catch (err) {
+      resetError = err instanceof Error ? err.message : String(err);
+      resetting = false;
+    }
+  }
 
   async function load() {
     if (!isAdmin()) return;
@@ -76,3 +93,17 @@ POST /api/v1/links   {'{'} template, discord_id, name?, username?, force_new? {'
 POST /api/v1/persons/link   {'{'} old_discord_id, new_discord_id {'}'}
 GET  /api/v1/submissions/:id/pdf</pre>
 </div>
+
+{#if isAdmin()}
+  <form class="card" onsubmit={resetData}>
+    <h2>Delete all application data</h2>
+    <p>Permanently delete all templates, source PDFs, submissions, signatures, people, links, and activity. This also clears settings and API tokens and signs everyone out.</p>
+    <p class="muted small">Backups, exports, and downloaded copies are kept. You can delete backup archives separately under Backups.</p>
+    <label for="confirm-reset">Type <b>DELETE ALL DATA</b> to confirm.</label>
+    <div class="row">
+      <input id="confirm-reset" style="max-width:240px" bind:value={confirmation} autocomplete="off" disabled={resetting} />
+      <button type="submit" class="danger" disabled={resetting || confirmation !== 'DELETE ALL DATA'}>{resetting ? 'Deleting…' : 'Delete all application data'}</button>
+    </div>
+    {#if resetError}<div class="error" role="alert">{resetError}</div>{/if}
+  </form>
+{/if}

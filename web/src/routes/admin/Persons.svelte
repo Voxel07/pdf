@@ -1,9 +1,14 @@
 <script lang="ts">
-  import { admin, copy, type Template } from '../../lib/api';
+  import { admin, copy, type PersonGroup, type Template } from '../../lib/api';
+  import ListPagination from '../../lib/ListPagination.svelte';
+  import { pagedList, pageSize } from '../../lib/paged-list.svelte';
   import { route } from '../../lib/router.svelte';
   import { isAdmin } from '../../lib/session.svelte';
 
-  let list = $state<any[]>([]);
+  const people = pagedList<any>((p) => p.name);
+  const list = $derived(people.items);
+  let groups = $state<PersonGroup[]>([]);
+  let addGroup = $state('');
   let q = $state(route.query.get('q') ?? '');
   let templates = $state<Template[]>([]);
   let openId = $state<string | null>(null);
@@ -25,15 +30,13 @@
   let createdLink = $state('');
 
   admin.get('/templates').then((t) => (templates = t));
+  admin.get<PersonGroup[]>('/groups').then((result) => (groups = result)).catch((e) => (error = e.message));
 
-  async function load() {
-    list = await admin.get(`/persons?q=${encodeURIComponent(q)}`);
-  }
-  let timer: ReturnType<typeof setTimeout>;
+  const path = $derived(`/persons?q=${encodeURIComponent(q)}`);
   $effect(() => {
-    q;
-    clearTimeout(timer);
-    timer = setTimeout(load, 200);
+    const query = path;
+    const timer = setTimeout(() => people.load(query), q ? 150 : 0);
+    return () => { clearTimeout(timer); people.cancel(); };
   });
 
   async function run(fn: () => Promise<unknown>, ok?: string) {
@@ -42,7 +45,7 @@
     try {
       await fn();
       if (ok) info = ok;
-      await load();
+      people.load(path, false);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
@@ -73,11 +76,12 @@
   const dupCount = $derived(list.reduce((m, p) => m.set(norm(p.name), (m.get(norm(p.name)) ?? 0) + 1), new Map<string, number>()));
   const isDup = (p: any) => (dupCount.get(norm(p.name)) ?? 0) > 1;
 
-  // sorting (client side; the server returns up to 1000 people)
+  // Apply the selected ordering to all loaded pages.
   type SortKey = 'name' | 'discord' | 'documents';
   let sortKey = $state<SortKey>('name');
   let sortDir = $state<1 | -1>(1);
   function sortBy(k: SortKey) {
+    people.page = 1;
     if (sortKey === k) sortDir = sortDir === 1 ? -1 : 1;
     else {
       sortKey = k;
@@ -103,11 +107,11 @@
 
   function toggle(p: any) {
     openId = openId === p.id ? null : p.id;
-    addDiscord = mergeInto = createdLink = '';
+    addGroup = addDiscord = mergeInto = createdLink = '';
   }
 </script>
 
-<h1>People</h1>
+<div class="row"><h1 class="grow">People</h1><a class="btn" href="/admin/persons/groups">Groups &amp; requirements</a></div>
 {#if error}<div class="error">{error}</div>{/if}
 {#if info}<div class="success">{info}</div>{/if}
 
@@ -134,22 +138,24 @@
 </div>
 
 <div class="card" style="margin-top:16px">
+  {#if people.error}<div class="error">{people.error} <button class="small" onclick={() => people.load(path)}>Retry</button></div>{/if}
   <input placeholder="Search name, e-mail, Discord id or username" bind:value={q} />
   <table style="margin-top:10px">
     <thead><tr>
       <th aria-sort={sortKey === 'name' ? (sortDir === 1 ? 'ascending' : 'descending') : 'none'}><button class="sort" class:on={sortKey === 'name'} onclick={() => sortBy('name')}>Name{arrow('name')}</button></th>
       <th aria-sort={sortKey === 'discord' ? (sortDir === 1 ? 'ascending' : 'descending') : 'none'}><button class="sort" class:on={sortKey === 'discord'} onclick={() => sortBy('discord')}>Discord{arrow('discord')}</button></th>
       <th aria-sort={sortKey === 'documents' ? (sortDir === 1 ? 'ascending' : 'descending') : 'none'}><button class="sort" class:on={sortKey === 'documents'} onclick={() => sortBy('documents')}>Documents{arrow('documents')}</button></th>
-      <th style="text-align:right"><span class="small muted" style="text-transform:none;font-weight:400">{list.length} {list.length === 1 ? 'person' : 'people'}</span></th>
+      <th></th>
     </tr></thead>
     <tbody>
-      {#each sorted as p (p.id)}
+      {#each sorted.slice((people.page - 1) * pageSize, people.page * pageSize) as p (p.id)}
         <tr>
           <td><b>{p.name}</b>
+            {#each p.groups as group}<span class="badge">{group.name}</span>{/each}
             {#if isDup(p)}<span class="badge pending" title="Several people share this name - their zip code tells them apart on general links">same name{p.zip ? '' : ' · no zip!'}</span>{/if}
             <div class="small muted">{[p.zip, p.email].filter(Boolean).join(' · ')}</div></td>
           <td>{#each p.discord_accounts as d}<div><code>{d.discord_id}</code> <span class="small muted">{d.username ?? ''}</span></div>{:else}<span class="muted">—</span>{/each}</td>
-          <td><a href="/admin/submissions?q={encodeURIComponent(p.name)}">{p.submission_count}</a></td>
+          <td><a href="/admin/submissions?person_id={p.id}&person_name={encodeURIComponent(p.name)}" aria-label="View {p.submission_count} documents for {p.name}">{p.submission_count}</a></td>
           <td style="text-align:right"><button class="small" onclick={() => toggle(p)}>{openId === p.id ? 'Close' : 'Manage'}</button></td>
         </tr>
         {#if openId === p.id}
@@ -157,6 +163,19 @@
             <td colspan="4" style="background:var(--panel-2)">
               <div class="grid2">
                 <div>
+                  <label for="group-{p.id}">Groups</label>
+                  {#each p.groups as group}
+                    <div class="row small">{group.name}
+                      <button class="small ghost" onclick={() => run(() => admin.del(`/groups/${group.id}/members/${p.id}`), 'Group removed')}>Remove</button>
+                    </div>
+                  {/each}
+                  <div class="row" style="margin-bottom:10px">
+                    <select id="group-{p.id}" bind:value={addGroup} style="flex:1;width:auto">
+                      <option value="">Choose group</option>
+                      {#each groups.filter((g) => !p.groups.some((member: PersonGroup) => member.id === g.id)) as g}<option value={g.id}>{g.name}</option>{/each}
+                    </select>
+                    <button class="small" disabled={!addGroup} onclick={() => run(async () => { await admin.put(`/groups/${addGroup}/members/${p.id}`, {}); addGroup = ''; }, 'Group assigned')}>Assign</button>
+                  </div>
                   <label for="nm-{p.id}">Name (second factor for signing links)</label>
                   <div class="row">
                     <input id="nm-{p.id}" bind:value={p.name} style="flex:1;width:auto" />
@@ -201,4 +220,6 @@
       {/each}
     </tbody>
   </table>
+  {#if !list.length && !people.loading && !people.error}<p class="muted">No people found.</p>{/if}
+  <ListPagination page={people.page} count={list.length} loading={people.loading} change={(p) => (people.page = p)} />
 </div>

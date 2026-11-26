@@ -5,6 +5,7 @@
   import PdfViewer from '../lib/PdfViewer.svelte';
   import SignaturePad from '../lib/SignaturePad.svelte';
   import { navigate } from '../lib/router.svelte';
+  import { signerPrefill } from '../lib/signer-prefill';
 
   let { token }: { token: string } = $props();
 
@@ -43,6 +44,7 @@
 
   function nextPerson() {
     sessionStorage.removeItem(sessionKey);
+    sessionStorage.removeItem(`pdfsign_zip_${token}`);
     sessionStorage.removeItem(`pdfsign_return_${token}`);
     navigate(returnTo ?? '/');
   }
@@ -99,7 +101,8 @@
       if (first) act[first.id] = true;
     }
     active = act;
-    input = {};
+    const editable = f.template.fields.filter((field) => !f.values[field.id] && !f.sections[field.section]?.done);
+    input = signerPrefill(editable, f.person_name, sessionStorage.getItem(`pdfsign_zip_${token}`) ?? '');
     if (!doc) doc = await loadPdf(`${base}/template.pdf`, { 'x-session': session });
     phase = 'form';
   }
@@ -337,7 +340,7 @@
                       {:else if f.type === 'date'}
                         <div class="row"><input id="in-{f.id}" class="grow" type="date" bind:value={input[f.id]} style="flex:1;width:auto" /><button class="small" onclick={() => (input[f.id] = today)}>Today</button></div>
                       {:else if f.type === 'number'}
-                        <input id="in-{f.id}" type="number" step="any" min={f.min} max={f.max} placeholder={f.placeholder} bind:value={input[f.id]} />
+                        <input id="in-{f.id}" type="number" step="any" min={f.min} max={f.max} placeholder={f.placeholder} value={input[f.id] ?? ''} oninput={(e) => (input[f.id] = e.currentTarget.value)} />
                       {:else if f.type === 'select'}
                         <select id="in-{f.id}" bind:value={input[f.id]}>
                           <option value="">— select —</option>

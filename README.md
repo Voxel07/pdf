@@ -65,21 +65,24 @@ Roles are re-read from authentik on every login. Sessions last 12 hours.
 
 ### 2. Discord bot
 
-1. Create an application and bot at <https://discord.com/developers/applications>. No privileged intents are needed. Invite it with the `bot` and `applications.commands` scopes.
+1. Create an application and bot at <https://discord.com/developers/applications>. Under **Bot**, enable **Message Content Intent**. Install it to your server using the `bot` scope. Give it **View Channel** and **Send Messages** where you want it to answer commands or post staff notifications.
 2. Log into pdfsign as an admin. Go to **API & export → Generate token** and put the token in `PDFSIGN_API_KEY`.
-3. Fill in `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_GUILD_ID` (recommended: commands show up instantly) and the template slugs `EVENT_TEMPLATE` / `EQUIPMENT_TEMPLATE`.
-4. `docker compose up -d bot`. Slash commands are registered on startup.
+3. Set `DISCORD_TOKEN` to the Discord bot token and set the template slugs `EVENT_TEMPLATE` / `EQUIPMENT_TEMPLATE`. Set `DISCORD_GUILD_ID` to limit server commands to one server, or leave it blank to serve every server the bot joins.
+4. Run `docker compose up -d bot`, then type `!help` in Discord. Unknown `!` commands also show the help menu. On upgrade, the bot removes its previous pdfsign slash commands on startup.
+
+The bot sends personal details and signing links by DM. Enable DMs from server members or use member commands in a direct message with the bot. Staff commands run in the server and send their results by DM. Staff can use an @mention or Discord user ID for a member argument.
 
 | Command | Who | What |
 | --- | --- | --- |
-| `/register name zip` | everyone | Register or change your full name (checked when opening a link) and zip code |
-| `/signup [event]` | everyone | Checks for a valid waiver. If there is none, you get a signing link |
-| *"Interested" on a Discord scheduled event* | everyone | Same as `/signup`, delivered by DM. Staff are notified in `NOTIFY_CHANNEL_ID` if DMs are closed |
-| `/equipment` | everyone | Opens your equipment form again to add items |
-| `/documents` | everyone | Your documents, their status and links |
-| `/handout user [items]` | staff | DMs the recipient their equipment form (asks them to register first if needed) |
-| `/docs status user` / `/docs send user template` | staff | Shows a member's documents / sends a link for any template |
-| `/link-account old_id new_user` | staff | Moves all data of a lost Discord account to the new one |
+| `!help` | everyone | Show the command menu |
+| `!register` | everyone | Open a private form to register or update your full name and ZIP code |
+| `!signup [event]` | everyone | Checks for a valid waiver. If there is none, you get a signing link |
+| *"Interested" on a Discord scheduled event* | everyone | Same as `!signup`, delivered by DM. Staff are notified in `NOTIFY_CHANNEL_ID` if DMs are closed |
+| `!equipment` | everyone | Opens your equipment form again to add items |
+| `!documents` | everyone | Your documents, their status and links |
+| `!handout @member [items]` | staff | DMs the recipient their equipment form (asks them to register first if needed) |
+| `!docs status @member` / `!docs send @member <template-slug>` | staff | Shows a member's documents / sends a link for any template |
+| `!link-account <old-user-id> @new-member` | staff | Moves all data of a lost Discord account to the new one |
 
 Staff commands require the *Manage Server* permission. If `ADMIN_ROLE_IDS` is set, they require one of those roles instead, and *Manage Server* alone no longer counts.
 

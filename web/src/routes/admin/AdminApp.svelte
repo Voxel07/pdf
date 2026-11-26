@@ -8,6 +8,7 @@
   import Submissions from './Submissions.svelte';
   import SubmissionDetail from './SubmissionDetail.svelte';
   import Persons from './Persons.svelte';
+  import Groups from './Groups.svelte';
   import Import from './Import.svelte';
   import Settings from './Settings.svelte';
   import Backups from './Backups.svelte';
@@ -31,7 +32,6 @@
     ['/admin/templates', 'Templates'],
     ['/admin/submissions', 'Documents'],
     ['/admin/persons', 'People'],
-    ['/admin/activity', 'Activity'],
     ['/admin/import', 'DocuSeal import', 'admin'],
     ['/admin/settings', 'API & export'],
     ['/admin/backups', 'Backups', 'admin'],
@@ -51,6 +51,11 @@
         <a {href} class:active={href === '/admin' ? sub === '/admin' : sub.startsWith(href)}>{label}</a>
       {/each}
       <span class="spacer"></span>
+      <a href="/admin/activity" class="bell" class:active={sub === '/admin/activity'} aria-label="Activity log" title="Activity log">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M18 8a6 6 0 0 0-12 0c0 7-3 8-3 9h18c0-1-3-2-3-9ZM10 20a2.2 2.2 0 0 0 4 0"/>
+        </svg>
+      </a>
       <span class="small muted">{session.user.name || session.user.username} · <span class="badge accent">{session.user.role}</span></span>
       <button class="small ghost" onclick={nextTheme} title="Theme: {theme.choice} (click to change)" aria-label="Change theme, currently {theme.choice}">{theme.choice === 'dark' ? '🌙' : theme.choice === 'light' ? '☀️' : '🖥️'}</button>
       <a class="btn small" href="/auth/logout" data-external>Log out</a>
@@ -63,9 +68,11 @@
       {:else if sub === '/admin/templates'}
         <Templates />
       {:else if sub === '/admin/submissions'}
-        <Submissions />
+        {#key route.query.toString()}<Submissions />{/key}
       {:else if sub === '/admin/persons'}
-        <Persons />
+        {#key route.query.toString()}<Persons />{/key}
+      {:else if sub === '/admin/persons/groups'}
+        <Groups />
       {:else if sub === '/admin/activity'}
         <Activity />
       {:else if sub === '/admin/import' && isAdmin()}
@@ -88,6 +95,7 @@
   nav a { padding: 6px 12px; border-radius: 6px; color: var(--text); font-weight: 500; font-size: 0.93rem; }
   nav a:hover { background: var(--hover); text-decoration: none; }
   nav a.active { background: var(--accent-soft); color: var(--accent-text); }
+  nav a.bell { display:inline-flex; align-items:center; padding:7px; }
   .content { max-width: 1150px; margin: 0 auto; padding: 22px 18px 60px; }
   .wide .content { max-width: none; padding: 14px; }
 </style>

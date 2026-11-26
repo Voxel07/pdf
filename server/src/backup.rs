@@ -169,8 +169,15 @@ fn ensure_writable(dir: &Path) -> anyhow::Result<()> {
 
 /// Middleware: state-changing requests wait while a backup snapshot is being taken.
 pub async fn write_gate(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    // the manual backup endpoint itself must not hold the gate (it takes the write side)
-    if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) || req.uri().path() == "/api/admin/backup/run" {
+    let path = req.uri().path();
+    if req.method() == Method::DELETE && path == "/api/admin/data" {
+        let _guard = state.gate.write().await;
+        return next.run(req).await;
+    }
+    // Auth callbacks and ZIP exports also write records. Manual backups take their own guard.
+    let read_only = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS)
+        && !path.starts_with("/auth/") && path != "/api/admin/export.zip";
+    if read_only || path == "/api/admin/backup/run" {
         return next.run(req).await;
     }
     let _guard = state.gate.clone().read_owned().await;

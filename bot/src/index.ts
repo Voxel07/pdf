@@ -2,27 +2,27 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  ChatInputCommandInteraction,
+  ApplicationCommandType,
   Client,
   EmbedBuilder,
   Events,
   GatewayIntentBits,
-  GuildMember,
   MessageFlags,
   ModalBuilder,
   Partials,
   TextInputBuilder,
   TextInputStyle,
   type Interaction,
+  type Message,
+  type MessageCreateOptions,
   type User,
 } from 'discord.js';
-import { REST, Routes } from 'discord.js';
 import { api, ApiError, type Submission } from './api';
-import { commands } from './commands';
+import { commandHelp, legacyCommands } from './commands';
 import { config } from './config';
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildScheduledEvents, GatewayIntentBits.DirectMessages],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildScheduledEvents, GatewayIntentBits.DirectMessages],
   partials: [Partials.Channel, Partials.GuildScheduledEvent, Partials.User],
 });
 
@@ -120,111 +120,153 @@ function introFor(purpose: Purpose, sub: Submission, extra?: string) {
 
 // -----------------------------------------------------------------------------------------
 
-async function isStaff(i: ChatInputCommandInteraction) {
-  const m = i.member;
-  if (!(m instanceof GuildMember)) return false;
-  if (config.adminRoleIds.length) return m.roles.cache.some((r) => config.adminRoleIds.includes(r.id));
-  return m.permissions.has('ManageGuild');
+function isStaff(message: Message) {
+  const member = message.member;
+  if (!member) return false;
+  if (config.adminRoleIds.length) return member.roles.cache.some((role) => config.adminRoleIds.includes(role.id));
+  return member.permissions.has('ManageGuild');
 }
 
-async function handleCommand(i: ChatInputCommandInteraction) {
-  switch (i.commandName) {
-    case 'register': {
-      const name = i.options.getString('name', true);
-      await api.register(i.user.id, name, i.user.username, i.options.getString('zip', true));
-      return i.reply({ content: `✅ Registered as **${name}**. Use this name to open your documents.`, flags: MessageFlags.Ephemeral });
+async function privateReply(message: Message, payload: string | MessageCreateOptions) {
+  const options = typeof payload === 'string' ? { content: payload } : payload;
+  options.allowedMentions = { parse: [], repliedUser: false };
+  if (!message.inGuild()) return message.reply(options);
+  if (!(await dm(message.author, options))) {
+    return message.reply({ content: 'I could not DM you. Enable direct messages from server members to receive private replies.', allowedMentions: { repliedUser: false } });
+  }
+}
+
+async function handleCommand(message: Message, command: string, args: string) {
+  const user = message.author;
+  const staff = isStaff(message);
+  const reply = (payload: string | MessageCreateOptions) => privateReply(message, payload);
+  const help = (intro?: string) => message.reply({ content: commandHelp(staff, intro), allowedMentions: { repliedUser: false } });
+  const askToRegister = (purpose: Purpose) =>
+    reply({ content: 'Register your name and ZIP code to continue.', components: [registerRow(purpose)] });
+  const [first, second, ...rest] = args.split(/\s+/);
+
+  async function findMember(input: string | undefined) {
+    const match = /^(?:<@!?(\d+)>|(\d+))$/.exec(input ?? '');
+    if (!message.inGuild() || !match) return undefined;
+    try {
+      return (await message.guild.members.fetch(match[1] ?? match[2])).user;
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && (error.code === 10007 || error.code === 10013)) return undefined;
+      throw error;
     }
+  }
+
+  switch (command) {
+    case 'help':
+      return help();
+    case 'register':
+      return args ? help('Use !register without arguments to enter your details privately.') : askToRegister('none');
 
     case 'signup':
     case 'equipment': {
-      const purpose = i.commandName === 'signup' ? 'event' : 'equip';
-      const out = await resolve(i.user, purpose);
-      if (out.kind === 'need_name') return i.showModal(registerModal(purpose));
+      if (command === 'equipment' && args) return help('Usage: !equipment');
+      const purpose = command === 'signup' ? 'event' : 'equip';
+      const out = await resolve(user, purpose);
+      if (out.kind === 'need_name') return askToRegister(purpose);
       if (out.kind === 'valid')
-        return i.reply({ content: `✅ You're all set${i.options.getString('event') ? ` for **${i.options.getString('event')}**` : ''} — your waiver is valid until ${fmt(out.sub.valid_until)}.`, flags: MessageFlags.Ephemeral });
-      return i.reply({ embeds: [docEmbed(out.sub, introFor(purpose, out.sub))], components: [linkRow(out.sub.url)], flags: MessageFlags.Ephemeral });
+        return reply({ content: `✅ You're all set${args ? ` for **${args}**` : ''} — your waiver is valid until ${fmt(out.sub.valid_until)}.` });
+      return reply({ embeds: [docEmbed(out.sub, introFor(purpose, out.sub))], components: [linkRow(out.sub.url)] });
     }
 
     case 'documents': {
+      if (args) return help('Usage: !documents');
       let view;
       try {
-        view = await api.person(i.user.id);
+        view = await api.person(user.id);
       } catch (e) {
-        if (e instanceof ApiError && e.status === 404) return i.showModal(registerModal('none'));
+        if (e instanceof ApiError && e.status === 404) return askToRegister('none');
         throw e;
       }
       const subs = view.submissions.filter((s) => s.status !== 'revoked');
-      if (!subs.length) return i.reply({ content: 'You have no documents yet.', flags: MessageFlags.Ephemeral });
+      if (!subs.length) return reply({ content: 'You have no documents yet.' });
       const lines = subs.map((s) => `• **${s.template_name}** — ${s.valid ? `✅ valid until ${fmt(s.valid_until)}` : s.status === 'pending' ? '✍️ waiting for your signature' : `⚠️ ${s.status}`}`);
       const rows = subs.slice(0, 5).map((s) => linkRow(s.url, s.template_name.slice(0, 70)));
-      return i.reply({ content: `Registered as **${view.person.name}**\n${lines.join('\n')}`, components: rows, flags: MessageFlags.Ephemeral });
+      return reply({ content: `Registered as **${view.person.name}**\n${lines.join('\n')}`, components: rows });
     }
 
     case 'handout': {
-      if (!(await isStaff(i))) return i.reply({ content: 'Staff only.', flags: MessageFlags.Ephemeral });
-      const target = i.options.getUser('user', true);
-      const items = i.options.getString('items') ?? undefined;
-      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      if (!staff) return message.reply('Staff only. Run this command in the server.');
+      const target = await findMember(first);
+      if (!target) return help('Usage: !handout @member [items]');
+      const items = args.slice(first.length).trim();
       const out = await resolve(target, 'equip');
       if (out.kind === 'need_name') {
         const ok = await dm(target, {
           content: `You received equipment${items ? `: **${items}**` : ''}. Please register your full name so we can send you your equipment form.`,
           components: [registerRow('equip')],
         });
-        return i.editReply(ok ? `${target} is not registered yet — asked them via DM to register.` : `${target} is not registered and DMs are closed.`);
+        return reply(ok ? `${target} is not registered yet — asked them via DM to register.` : `${target} is not registered and DMs are closed.`);
       }
       if (out.kind === 'link') {
         const ok = await dm(target, { embeds: [docEmbed(out.sub, introFor('equip', out.sub, items))], components: [linkRow(out.sub.url, 'Open equipment form')] });
-        return i.editReply(ok ? `📦 Sent the equipment form to ${target}.` : `Could not DM ${target}. Link: ${out.sub.url}`);
+        return reply(ok ? `📦 Sent the equipment form to ${target}.` : `Could not DM ${target}. Link: ${out.sub.url}`);
       }
-      return i.editReply('Unexpected state.');
+      return reply('Unexpected state.');
     }
 
     case 'docs': {
-      if (!(await isStaff(i))) return i.reply({ content: 'Staff only.', flags: MessageFlags.Ephemeral });
-      const target = i.options.getUser('user', true);
-      if (i.options.getSubcommand() === 'status') {
+      if (!staff) return message.reply('Staff only. Run this command in the server.');
+      const status = first === 'status' && rest.length === 0;
+      const send = first === 'send' && rest.length === 1;
+      if (!status && !send) return help('Usage: !docs status @member or !docs send @member <template-slug>');
+      const target = await findMember(second);
+      if (!target) return help('Mention a member of this server or enter their Discord user ID.');
+      if (status) {
         try {
           const v = await api.person(target.id);
           const lines = v.submissions.map((s) => `• **${s.template_name}** — ${s.valid ? `valid until ${fmt(s.valid_until)}` : s.status}`);
-          return i.reply({ content: `**${v.person.name}** (${v.discord_accounts.map((a) => a.discord_id).join(', ')})\n${lines.join('\n') || 'no documents'}`, flags: MessageFlags.Ephemeral });
+          return reply({ content: `**${v.person.name}** (${v.discord_accounts.map((a) => a.discord_id).join(', ')})\n${lines.join('\n') || 'no documents'}` });
         } catch (e) {
-          if (e instanceof ApiError && e.status === 404) return i.reply({ content: `${target} is not registered.`, flags: MessageFlags.Ephemeral });
+          if (e instanceof ApiError && e.status === 404) return reply({ content: `${target} is not registered.` });
           throw e;
         }
       }
-      const slug = i.options.getString('template', true);
-      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      const [slug] = rest;
       const purpose = `tpl:${slug}`;
       const out = await resolve(target, purpose);
       if (out.kind === 'need_name') {
         const ok = await dm(target, { content: 'You have a document to sign. Please register your full name first.', components: [registerRow(purpose)] });
-        return i.editReply(ok ? `${target} is not registered yet — asked them via DM.` : `${target} is not registered and DMs are closed.`);
+        return reply(ok ? `${target} is not registered yet — asked them via DM.` : `${target} is not registered and DMs are closed.`);
       }
-      if (out.kind !== 'link') return i.editReply('Unexpected state.');
+      if (out.kind !== 'link') return reply('Unexpected state.');
       const ok = await dm(target, { embeds: [docEmbed(out.sub, introFor(purpose, out.sub))], components: [linkRow(out.sub.url)] });
-      return i.editReply(ok ? `Sent **${out.sub.template_name}** to ${target}.` : `Could not DM ${target}. Link: ${out.sub.url}`);
+      return reply(ok ? `Sent **${out.sub.template_name}** to ${target}.` : `Could not DM ${target}. Link: ${out.sub.url}`);
     }
 
     case 'link-account': {
-      if (!(await isStaff(i))) return i.reply({ content: 'Staff only.', flags: MessageFlags.Ephemeral });
-      const oldId = i.options.getString('old_id', true).trim();
-      const target = i.options.getUser('new_user', true);
+      if (!staff) return message.reply('Staff only. Run this command in the server.');
+      const oldId = first;
+      if (!/^\d+$/.test(oldId) || rest.length) return help('Usage: !link-account <old-user-id> @new-member');
+      const target = await findMember(second);
+      if (!target) return help('Mention the replacement member or enter their Discord user ID.');
       const v = await api.linkAccounts(oldId, target.id, target.username);
-      return i.reply({ content: `🔗 Linked ${target} to **${v.person.name}** (${v.submissions.length} documents kept).`, flags: MessageFlags.Ephemeral });
+      return reply({ content: `🔗 Linked ${target} to **${v.person.name}** (${v.submissions.length} documents kept).` });
     }
+    default:
+      return help('Unknown command.');
   }
 }
 
-async function handleInteraction(i: Interaction) {
-  if (i.isChatInputCommand()) return handleCommand(i);
-
-  if (i.isAutocomplete() && i.commandName === 'docs') {
-    const q = i.options.getFocused().toLowerCase();
-    const list = await api.templates();
-    return i.respond(list.filter((t) => t.name.toLowerCase().includes(q) || t.slug.includes(q)).slice(0, 25).map((t) => ({ name: t.name.slice(0, 100), value: t.slug })));
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot || !message.content.startsWith('!')) return;
+  if (config.guildId && message.guildId && message.guildId !== config.guildId) return;
+  const input = message.content.slice(1).trim();
+  const command = input.split(/\s+/, 1)[0];
+  try {
+    await handleCommand(message, command.toLowerCase(), input.slice(command.length).trim());
+  } catch (error) {
+    console.error('message command failed', error);
+    const content = error instanceof ApiError ? error.message : 'Something went wrong. Please try again later.';
+    await privateReply(message, { content }).catch(console.error);
   }
+});
 
+async function handleInteraction(i: Interaction) {
   if (i.isButton() && i.customId.startsWith('regbtn:')) return i.showModal(registerModal(i.customId.slice(7)));
 
   if (i.isModalSubmit() && i.customId.startsWith('reg:')) {
@@ -271,12 +313,20 @@ client.on(Events.GuildScheduledEventUserAdd, async (event, user) => {
 });
 
 client.once(Events.ClientReady, async (c) => {
-  console.log(`Logged in as ${c.user.tag}`);
-  if (process.env.REGISTER_COMMANDS !== 'false') {
-    const rest = new REST().setToken(config.token);
-    const route = config.guildId ? Routes.applicationGuildCommands(config.clientId, config.guildId) : Routes.applicationCommands(config.clientId);
-    await rest.put(route, { body: commands.map((cmd) => cmd.toJSON()) }).catch((e) => console.error('command registration failed', e));
-    console.log('Slash commands registered');
+  console.log(`Logged in as ${c.user.tag}. Listening for ! commands.`);
+  if (process.env.REGISTER_COMMANDS === 'false') return;
+
+  // Retire the old pdfsign commands while preserving other application commands.
+  const managers = [c.application.commands, ...c.guilds.cache.map((guild) => guild.commands)];
+  for (const manager of managers) {
+    try {
+      const registered = await manager.fetch({});
+      for (const command of registered.values()) {
+        if (command.type === ApplicationCommandType.ChatInput && legacyCommands.has(command.name)) await command.delete();
+      }
+    } catch (error) {
+      console.error('legacy slash command cleanup failed', error);
+    }
   }
 });
 client.login(config.token);

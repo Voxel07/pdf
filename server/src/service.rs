@@ -17,6 +17,38 @@ use crate::pdf::{self, AuditLine, DrawItem, DrawValue};
 use crate::state::AppState;
 use crate::util::*;
 
+/// The HTTP write gate is held exclusively. Detached jobs can outlive their start request.
+pub async fn reset_application_data(state: &AppState) -> AppResult<()> {
+    let _backup = state.backup_running.try_lock().map_err(|_| AppError::conflict("backup_running", "wait for the backup to finish and try again"))?;
+    if state.import.lock().unwrap().running || state.export_jobs.lock().unwrap().values().any(|j| j.running) {
+        return Err(AppError::conflict("job_running", "wait for the import or export to finish and try again"));
+    }
+
+    let mut tx = begin_write(&state.pool).await?;
+    // Also collect PDFs left behind by an interrupted upload or an older deletion.
+    let mut files = tokio::fs::read_dir(state.cfg.data_dir.join("templates")).await?;
+    while let Some(file) = files.next_entry().await? {
+        let path = file.path();
+        if path.extension().is_some_and(|ext| ext == "pdf")
+            && let Some(id) = path.file_stem().and_then(|s| s.to_str())
+            && uuid::Uuid::parse_str(id).is_ok()
+            && !file.file_type().await?.is_dir()
+        {
+            sqlx::query("INSERT OR IGNORE INTO deleted_template_pdfs (id) VALUES (?)").bind(id).execute(&mut *tx).await?;
+        }
+    }
+    // Foreign keys remove documents, values, signing rounds, links, accounts and sessions.
+    sqlx::raw_sql("DELETE FROM templates; DELETE FROM persons; DELETE FROM person_groups; DELETE FROM users; DELETE FROM api_keys;
+                   DELETE FROM oidc_states; DELETE FROM settings; DELETE FROM activity_log; DELETE FROM sqlite_sequence;")
+        .execute(&mut *tx).await?;
+    tx.commit().await?;
+    state.limiter.lock().unwrap().clear();
+    *state.import.lock().unwrap() = Default::default();
+    state.export_jobs.lock().unwrap().clear();
+    state.clean_deleted_pdfs().await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------
 // Templates
 
@@ -407,6 +439,8 @@ pub async fn merge_persons(pool: &SqlitePool, from: &str, into: &str) -> AppResu
     let mut tx = pool.begin().await?;
     sqlx::query("UPDATE submissions SET person_id = ? WHERE person_id = ?").bind(into).bind(from).execute(&mut *tx).await?;
     sqlx::query("UPDATE discord_accounts SET person_id = ? WHERE person_id = ?").bind(into).bind(from).execute(&mut *tx).await?;
+    sqlx::query("INSERT OR IGNORE INTO group_members (person_id, group_id) SELECT ?, group_id FROM group_members WHERE person_id = ?")
+        .bind(into).bind(from).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM persons WHERE id = ?").bind(from).execute(&mut *tx).await?;
     tx.commit().await?;
     get_person(pool, into).await
@@ -511,11 +545,15 @@ pub struct Validity {
 }
 
 pub fn validity(t: &Template, s: &Submission) -> Validity {
+    submission_validity(t.validity_days, s)
+}
+
+fn submission_validity(validity_days: Option<i64>, s: &Submission) -> Validity {
     if s.status != "completed" {
         return Validity { valid: false, valid_until: None, expired: false };
     }
     let completed = s.completed_at.as_deref().and_then(parse_ts);
-    match (t.validity_days, completed) {
+    match (validity_days, completed) {
         (Some(days), Some(c)) => {
             let until = c + Duration::days(days);
             let expired = until <= Utc::now();
@@ -1101,14 +1139,18 @@ fn walk(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 
 pub async fn submission_json(state: &AppState, s: &Submission, t: &Template) -> AppResult<Value> {
     let person = get_person(&state.pool, &s.person_id).await?;
-    let v = validity(t, s);
-    Ok(json!({
+    Ok(submission_summary(state, s, &person.name, &t.name, &t.slug, t.validity_days))
+}
+
+pub fn submission_summary(state: &AppState, s: &Submission, person_name: &str, template_name: &str, slug: &str, days: Option<i64>) -> Value {
+    let v = submission_validity(days, s);
+    json!({
         "id": s.id,
-        "template_id": t.id,
-        "template_slug": t.slug,
-        "template_name": t.name,
-        "person_id": person.id,
-        "person_name": person.name,
+        "template_id": s.template_id,
+        "template_slug": slug,
+        "template_name": template_name,
+        "person_id": s.person_id,
+        "person_name": person_name,
         "status": if v.expired { "expired" } else { s.status.as_str() },
         "valid": v.valid,
         "valid_until": v.valid_until,
@@ -1118,5 +1160,5 @@ pub async fn submission_json(state: &AppState, s: &Submission, t: &Template) -> 
         "locked": s.failed_attempts >= state.cfg.max_name_attempts,
         "source": s.source,
         "url": state.sign_url(&s.token),
-    }))
+    })
 }

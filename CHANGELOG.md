@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-11-26
+
+### Added
+
+- `!help` shows the Discord bot’s command menu. Unknown `!` commands show the same menu, with staff commands included for authorized users.
+- Staff can create groups and set required templates under **People → Groups & requirements**, which also lists the members who still need a valid signature. Assign people to one or more groups under **People → Manage**. Groups cannot be renamed or deleted yet.
+- Clicking a person’s document count opens their documents, including pending, signed, expired, and revoked records. People with identical names have separate document lists. Person names in the Documents list link to the same view.
+
+#### Data deletion
+
+These actions require the admin role.
+
+- One submission — Open it under Documents and select Delete submission. This removes its values, signatures, signing link, and audit trail.
+- One template — Open it under Templates and select Permanently delete template. This removes its source PDF, general links, and all associated submissions. Archive template is still available to keep its records.
+- All live application data — Under API & export, type DELETE ALL DATA to confirm the reset. It clears records, settings, API tokens, and the activity log and signs everyone out. Separately saved backups, exports, and downloads are preserved. The reset is refused while a backup, DocuSeal import, or export is running.
+
+### Changed
+
+- People and Documents show 50 entries per page and fetch the remaining pages in the background.
+- The notification bell on the right of the admin navigation opens the activity log.
+- Signing forms prefill matching first name, surname, full name, and ZIP fields from the identification step. Signers can correct these entries before submitting.
+- Discord commands now use the `!` prefix. Enable **Message Content Intent** in the Discord Developer Portal before upgrading, and give the bot **View Channel** and **Send Messages** where it should answer commands. The `applications.commands` invite scope is no longer needed.
+- The bot removes its legacy pdfsign slash commands on startup and leaves other application commands alone. Set `REGISTER_COMMANDS=false` to skip this cleanup.
+- `DISCORD_CLIENT_ID` is no longer used and can be removed from `.env`. The `bun run register` script was removed.
+- `!register` opens a private registration form. The bot sends personal details and signing links by DM, including the results of staff commands. In a DM with the bot, `!help` lists member commands only.
+- Merging two people keeps the group memberships of both.
+
+### Fixed
+
+- The **Expired** filter on Documents could miss expired documents, because it was applied after the list was cut to 500 entries. The filter now runs in the database.
+- Admin logins and ZIP exports could write to the database while a backup snapshot was being taken. They now wait for the snapshot like other changes.
+
 ## [0.0.2] - 2026-11-26
 
 ### Added
@@ -46,6 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - authentik (OIDC) login with admin and staff roles, and a bot API with API tokens.
 - Discord bot.
 
-[Unreleased]: https://github.com/Voxel07/pdf/compare/0.0.2...HEAD
+[Unreleased]: https://github.com/Voxel07/pdf/compare/0.0.3...HEAD
+[0.0.3]: https://github.com/Voxel07/pdf/compare/0.0.2...0.0.3
 [0.0.2]: https://github.com/Voxel07/pdf/compare/0.0.1...0.0.2
 [0.0.1]: https://github.com/Voxel07/pdf/releases/tag/0.0.1

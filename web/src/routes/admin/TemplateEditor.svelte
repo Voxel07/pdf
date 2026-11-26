@@ -2,6 +2,7 @@
   import { admin, adminFetch, randomId, type Field, type FieldKind, type Section, type Template } from '../../lib/api';
   import { loadPdf, type PdfDoc } from '../../lib/pdf';
   import { navigate } from '../../lib/router.svelte';
+  import { isAdmin } from '../../lib/session.svelte';
   import PdfViewer from '../../lib/PdfViewer.svelte';
   import GeneralLinks from './GeneralLinks.svelte';
   import PdfPreview from '../../lib/PdfPreview.svelte';
@@ -245,10 +246,28 @@
     }
   }
 
-  async function archive() {
-    if (!confirm('Delete this template? (Templates with documents are archived instead.)')) return;
-    await admin.del(`/templates/${id}`);
-    navigate('/admin/templates');
+  let removing = $state(false);
+  async function removeTemplate(action: 'delete' | 'archive' | 'remove') {
+    if (!t || removing) return;
+    const messages = {
+      delete: `Permanently delete "${t.name}", its source PDF, general links, and every submission and signature for this template?`,
+      archive: `Archive "${t.name}" and keep its submissions?`,
+      remove: `Remove "${t.name}"? Templates with submissions will be archived. Empty templates will be deleted.`,
+    };
+    if (!confirm(messages[action])) return;
+    removing = true;
+    error = '';
+    try {
+      if (action === 'delete') await admin.del(`/templates/${id}/permanent`);
+      else if (action === 'archive') await admin.put(`/templates/${id}`, { archived: true });
+      else await admin.del(`/templates/${id}`);
+      dirty = false;
+      navigate('/admin/templates');
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    } finally {
+      removing = false;
+    }
   }
 
   function onKey(e: KeyboardEvent) {
@@ -398,7 +417,12 @@
         </div>
         <div class="row">
           <button class="small" onclick={duplicateTemplate} title="Create a new template from this one (PDF, fields, sections, settings)">Copy as new template</button>
-          <button class="small danger" onclick={archive}>Delete / archive template</button>
+          {#if isAdmin()}
+            {#if !t.archived}<button class="small" disabled={removing || saving} onclick={() => removeTemplate('archive')}>Archive template</button>{/if}
+            <button class="small danger" disabled={removing || saving} onclick={() => removeTemplate('delete')}>Permanently delete template</button>
+          {:else}
+            <button class="small danger" disabled={removing || saving} onclick={() => removeTemplate('remove')}>Delete / archive template</button>
+          {/if}
         </div>
       </div>
 

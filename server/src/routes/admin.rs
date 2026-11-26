@@ -20,14 +20,18 @@ use crate::routes::public::pdf_response;
 use crate::service::{self, *};
 use crate::state::AppState;
 use crate::util::*;
+mod groups;
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .merge(groups::router())
         .route("/me", get(me))
         .route("/stats", get(stats))
         .route("/users", get(users))
+        .route("/data", delete(reset_data))
         .route("/templates", get(templates).post(upload_template))
         .route("/templates/{id}", get(template).put(update).delete(archive_template))
+        .route("/templates/{id}/permanent", delete(delete_template))
         .route("/templates/{id}/pdf", get(template_pdf))
         .route("/templates/{id}/preview.pdf", get(preview_pdf))
         .route("/templates/{id}/links", get(links).post(create_link))
@@ -161,17 +165,40 @@ async fn update(
 
 async fn archive_template(Staff(u): Staff, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
     let t = get_template(&st.pool, &id).await?;
-    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM submissions WHERE template_id = ?").bind(&t.id).fetch_one(&st.pool).await?;
+    let mut tx = begin_write(&st.pool).await?;
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM submissions WHERE template_id = ?").bind(&t.id).fetch_one(&mut *tx).await?;
     if n == 0 {
-        sqlx::query("DELETE FROM templates WHERE id = ?").bind(&t.id).execute(&st.pool).await?;
-        let _ = tokio::fs::remove_file(st.template_pdf_path(&t.id)).await;
+        sqlx::query("DELETE FROM templates WHERE id = ? RETURNING id").bind(&t.id).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        st.clean_deleted_pdfs().await?;
         activity::info(&st.pool, "template", Some(u.username.as_str()), format!("template '{}' deleted", t.name)).await;
         Ok(Json(json!({ "deleted": true })))
     } else {
-        sqlx::query("UPDATE templates SET archived = 1 WHERE id = ?").bind(&t.id).execute(&st.pool).await?;
+        sqlx::query("UPDATE templates SET archived = 1 WHERE id = ?").bind(&t.id).execute(&mut *tx).await?;
+        tx.commit().await?;
         activity::info(&st.pool, "template", Some(u.username.as_str()), format!("template '{}' archived ({n} documents kept)", t.name)).await;
         Ok(Json(json!({ "archived": true })))
     }
+}
+
+async fn delete_template(AdminUser(u): AdminUser, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
+    let name: String = sqlx::query_scalar("DELETE FROM templates WHERE id = ? RETURNING name").bind(id).fetch_one(&st.pool).await?;
+    st.clean_deleted_pdfs().await?;
+    activity::info(&st.pool, "template", Some(&u.username), format!("template '{name}' and its documents deleted")).await;
+    Ok(Json(json!({ "deleted": true })))
+}
+
+#[derive(Deserialize)]
+struct ResetRequest {
+    confirmation: String,
+}
+
+async fn reset_data(_u: AdminUser, State(st): State<AppState>, Json(req): Json<ResetRequest>) -> AppResult<Json<Value>> {
+    if req.confirmation != "DELETE ALL DATA" {
+        return Err(AppError::bad_request("type DELETE ALL DATA to confirm the reset"));
+    }
+    reset_application_data(&st).await?;
+    Ok(Json(json!({ "deleted": true })))
 }
 
 async fn template_pdf(_u: Staff, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Response> {
@@ -311,35 +338,44 @@ struct SubQuery {
     person_id: Option<String>,
     status: Option<String>,
     q: Option<String>,
+    limit: Option<u32>,
+    after_key: Option<String>,
+    after_id: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct DocumentRow {
+    #[sqlx(flatten)]
+    submission: Submission,
+    person_name: String,
+    template_name: String,
+    slug: String,
+    validity_days: Option<i64>,
 }
 
 async fn submissions(_u: Staff, State(st): State<AppState>, Query(q): Query<SubQuery>) -> AppResult<Json<Value>> {
     let like = q.q.as_ref().map(|s| format!("%{}%", s.trim()));
-    let subs: Vec<Submission> = sqlx::query_as(
-        "SELECT s.* FROM submissions s JOIN persons p ON p.id = s.person_id
+    let subs: Vec<DocumentRow> = sqlx::query_as(
+        "SELECT s.*, p.name AS person_name, t.name AS template_name, t.slug, t.validity_days
+         FROM document_status s JOIN persons p ON p.id = s.person_id JOIN templates t ON t.id = s.template_id
          WHERE (?1 IS NULL OR s.template_id = ?1) AND (?2 IS NULL OR s.person_id = ?2)
-           AND (?3 IS NULL OR s.status = ?3)
+           AND (?3 IS NULL OR s.effective_status = ?3 OR (?3 = 'completed' AND s.status = 'completed'))
            AND (?4 IS NULL OR p.name LIKE ?4 OR EXISTS (SELECT 1 FROM discord_accounts d WHERE d.person_id = p.id AND (d.discord_id LIKE ?4 OR d.username LIKE ?4)))
-         ORDER BY s.updated_at DESC LIMIT 500",
+           AND (?5 IS NULL OR (s.updated_at, s.id) < (?5, ?6))
+         ORDER BY s.updated_at DESC, s.id DESC LIMIT ?7",
     )
     .bind(&q.template_id)
     .bind(&q.person_id)
-    .bind(q.status.as_deref().filter(|s| *s != "expired" && !s.is_empty()))
+    .bind(q.status.as_deref().filter(|s| !s.is_empty()))
     .bind(like)
+    .bind(q.after_key)
+    .bind(q.after_id)
+    .bind(i64::from(q.limit.unwrap_or(500).clamp(1, 500)))
     .fetch_all(&st.pool)
     .await?;
-    let mut cache: std::collections::HashMap<String, Template> = Default::default();
-    let mut out = Vec::new();
-    for s in subs {
-        if !cache.contains_key(&s.template_id) {
-            cache.insert(s.template_id.clone(), get_template(&st.pool, &s.template_id).await?);
-        }
-        let v = submission_json(&st, &s, &cache[&s.template_id]).await?;
-        if q.status.as_deref() == Some("expired") && v["status"] != "expired" {
-            continue;
-        }
-        out.push(v);
-    }
+    let out: Vec<_> = subs.iter().map(|row|
+        submission_summary(&st, &row.submission, &row.person_name, &row.template_name, &row.slug, row.validity_days)
+    ).collect();
     Ok(Json(json!(out)))
 }
 
@@ -432,7 +468,7 @@ async fn rotate_token(Staff(u): Staff, State(st): State<AppState>, Path(id): Pat
 
 async fn delete_submission(AdminUser(u): AdminUser, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
     let what = describe_submission(&st, &id).await;
-    sqlx::query("DELETE FROM submissions WHERE id = ?").bind(&id).execute(&st.pool).await?;
+    sqlx::query("DELETE FROM submissions WHERE id = ? RETURNING id").bind(&id).fetch_one(&st.pool).await?;
     activity::info(&st.pool, "document", Some(u.username.as_str()), format!("{what} deleted")).await;
     Ok(Json(json!({ "ok": true })))
 }
@@ -443,25 +479,46 @@ async fn delete_submission(AdminUser(u): AdminUser, State(st): State<AppState>, 
 #[derive(Deserialize)]
 struct PersonQuery {
     q: Option<String>,
+    limit: Option<u32>,
+    after_key: Option<String>,
+    after_id: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PersonListRow {
+    #[sqlx(flatten)]
+    person: Person,
+    accounts: String,
+    groups: String,
+    submission_count: i64,
 }
 
 async fn persons(_u: Staff, State(st): State<AppState>, Query(q): Query<PersonQuery>) -> AppResult<Json<Value>> {
     let like = q.q.as_ref().filter(|s| !s.trim().is_empty()).map(|s| format!("%{}%", s.trim()));
-    let list: Vec<Person> = sqlx::query_as(
-        "SELECT p.* FROM persons p WHERE ?1 IS NULL OR p.name LIKE ?1 OR p.email LIKE ?1
-           OR EXISTS (SELECT 1 FROM discord_accounts d WHERE d.person_id = p.id AND (d.discord_id LIKE ?1 OR d.username LIKE ?1))
-         ORDER BY p.name COLLATE NOCASE LIMIT 1000",
+    let list: Vec<PersonListRow> = sqlx::query_as(
+        "SELECT p.*, (SELECT COUNT(*) FROM submissions WHERE person_id = p.id) AS submission_count,
+           (SELECT json_group_array(json_object('discord_id', discord_id, 'username', username,
+                  'person_id', person_id, 'linked_at', linked_at) ORDER BY linked_at)
+            FROM discord_accounts WHERE person_id = p.id) AS accounts,
+           (SELECT json_group_array(json_object('id', g.id, 'name', g.name) ORDER BY g.name)
+            FROM group_members m JOIN person_groups g ON g.id = m.group_id WHERE m.person_id = p.id) AS groups
+         FROM persons p WHERE (?1 IS NULL OR p.name LIKE ?1 OR p.email LIKE ?1
+           OR EXISTS (SELECT 1 FROM discord_accounts d WHERE d.person_id = p.id AND (d.discord_id LIKE ?1 OR d.username LIKE ?1)))
+           AND (?2 IS NULL OR (p.name COLLATE NOCASE, p.id) > (?2, ?3))
+         ORDER BY p.name COLLATE NOCASE, p.id LIMIT ?4",
     )
     .bind(like)
+    .bind(q.after_key)
+    .bind(q.after_id)
+    .bind(i64::from(q.limit.unwrap_or(1000).clamp(1, 1000)))
     .fetch_all(&st.pool)
     .await?;
     let mut out = Vec::new();
-    for p in list {
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM submissions WHERE person_id = ?").bind(&p.id).fetch_one(&st.pool).await?;
-        let accounts = discord_accounts(&st.pool, &p.id).await?;
-        let mut v = serde_json::to_value(&p).unwrap();
-        v["discord_accounts"] = json!(accounts);
-        v["submission_count"] = json!(n);
+    for row in list {
+        let mut v = json!(row.person);
+        v["discord_accounts"] = serde_json::from_str(&row.accounts).map_err(anyhow::Error::from)?;
+        v["groups"] = serde_json::from_str(&row.groups).map_err(anyhow::Error::from)?;
+        v["submission_count"] = json!(row.submission_count);
         out.push(v);
     }
     Ok(Json(json!(out)))

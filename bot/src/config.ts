@@ -8,7 +8,6 @@ function env(name: string, fallback?: string): string {
 
 export const config = {
   token: env('DISCORD_TOKEN'),
-  clientId: env('DISCORD_CLIENT_ID'),
   guildId: env('DISCORD_GUILD_ID', ''),
   apiUrl: env('PDFSIGN_URL', 'http://localhost:8080').replace(/\/$/, ''),
   apiKey: env('PDFSIGN_API_KEY'),

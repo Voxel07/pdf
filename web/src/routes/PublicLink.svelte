@@ -38,6 +38,7 @@
         phase = 'valid';
       } else if (r.result === 'sign') {
         sessionStorage.setItem(`pdfsign_session_${r.token}`, r.session);
+        sessionStorage.setItem(`pdfsign_zip_${r.token}`, zip.trim());
         sessionStorage.setItem(`pdfsign_return_${r.token}`, location.pathname);
         navigate(`/s/${r.token}`);
       }

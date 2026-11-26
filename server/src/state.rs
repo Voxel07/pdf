@@ -57,7 +57,25 @@ impl AppState {
                 sqlx::raw_sql(ddl).execute(&pool).await.with_context(|| format!("adding {table}.{column}"))?;
             }
         }
-        Ok(Self { pool, cfg: Arc::new(cfg), limiter: Default::default(), gate: Default::default(), backup_running: Default::default(), import: Default::default(), export_jobs: Default::default() })
+        let state = Self { pool, cfg: Arc::new(cfg), limiter: Default::default(), gate: Default::default(), backup_running: Default::default(), import: Default::default(), export_jobs: Default::default() };
+        if let Err(e) = state.clean_deleted_pdfs().await {
+            tracing::error!("pending template PDF cleanup: {e:#}");
+        }
+        Ok(state)
+    }
+
+    pub async fn clean_deleted_pdfs(&self) -> Result<()> {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM deleted_template_pdfs").fetch_all(&self.pool).await?;
+        for id in ids {
+            anyhow::ensure!(uuid::Uuid::parse_str(&id).is_ok(), "invalid template PDF id");
+            match tokio::fs::remove_file(self.template_pdf_path(&id)).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).context("records deleted, but PDF cleanup is pending"),
+            }
+            sqlx::query("DELETE FROM deleted_template_pdfs WHERE id = ?").bind(id).execute(&self.pool).await?;
+        }
+        Ok(())
     }
 
     pub fn template_pdf_path(&self, template_id: &str) -> PathBuf {
