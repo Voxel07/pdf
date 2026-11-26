@@ -4,6 +4,7 @@ WORKDIR /web
 COPY web/package.json web/bun.lock ./
 RUN bun install --frozen-lockfile
 COPY web/ ./
+COPY calendar/src/lib/dates.ts calendar/src/lib/events.ts /calendar/src/lib/
 RUN bun run build
 
 # --- backend --------------------------------------------------------------------------
@@ -24,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libzstd1=1.5.7+dfsg-1+deb13u1 \
       zlib1g=1:1.3.dfsg+really1.3.1-1+deb13u1 \
  && rm -rf /var/lib/apt/lists/* \
- && mkdir -p /data /export /backups && chmod 777 /data /export /backups
+ && install -d -m 0700 -o 10001 -g 10001 /data /export /backups
 COPY --from=server /src/target/release/pdfsign /usr/local/bin/pdfsign
 COPY --from=web /web/dist /app/web
 ENV PDFSIGN_VERSION=${VERSION} DATA_DIR=/data EXPORT_DIR=/export BACKUP_DIR=/backups WEB_DIR=/app/web BIND=0.0.0.0:8080

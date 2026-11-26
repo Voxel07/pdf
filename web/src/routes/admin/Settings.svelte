@@ -10,6 +10,9 @@
   let confirmation = $state('');
   let resetting = $state(false);
   let resetError = $state('');
+  let sessionError = $state('');
+  let sessionMessage = $state('');
+  let revokingUser = $state('');
 
   async function resetData(e: SubmitEvent) {
     e.preventDefault();
@@ -31,6 +34,25 @@
     users = await admin.get('/users');
   }
   load();
+
+  async function revokeSessions(id: string) {
+    if (revokingUser || !confirm('Revoke all active sessions for this user?')) return;
+    revokingUser = id;
+    sessionError = '';
+    sessionMessage = '';
+    try {
+      const { revoked } = await admin.del<{ revoked: number }>(`/users/${id}/sessions`);
+      if (id === session.user?.id) {
+        location.replace('/auth/logout');
+        return;
+      }
+      sessionMessage = `Revoked ${revoked} session(s).`;
+    } catch (error) {
+      sessionError = error instanceof Error ? error.message : String(error);
+    } finally {
+      revokingUser = '';
+    }
+  }
 
   async function create(e: SubmitEvent) {
     e.preventDefault();
@@ -72,12 +94,15 @@
 {#if isAdmin()}
   <div class="card">
     <h2>Users</h2>
-    <p class="muted">Users log in through authentik. Their role comes from authentik group membership and is updated on every login.</p>
+    <p class="muted">Sessions last 15 minutes. Remove group access in authentik and revoke sessions here to end access immediately.</p>
+    {#if sessionError}<div class="error" role="alert">{sessionError}</div>{/if}
+    {#if sessionMessage}<div class="success" role="status">{sessionMessage}</div>{/if}
     <table>
-      <thead><tr><th>User</th><th>E-mail</th><th>Role</th><th>Last login</th></tr></thead>
+      <thead><tr><th>User</th><th>E-mail</th><th>Role</th><th>Last login</th><th>Sessions</th></tr></thead>
       <tbody>
         {#each users as u (u.id)}
-          <tr><td><b>{u.name}</b> <span class="muted small">{u.username}</span></td><td>{u.email ?? '—'}</td><td><span class="badge accent">{u.role}</span></td><td>{fmtDateTime(u.last_login_at)}</td></tr>
+          <tr><td><b>{u.name}</b> <span class="muted small">{u.username}</span></td><td>{u.email ?? '—'}</td><td><span class="badge accent">{u.role}</span></td><td>{fmtDateTime(u.last_login_at)}</td>
+            <td><button class="small danger" disabled={!!revokingUser} onclick={() => revokeSessions(u.id)}>{revokingUser === u.id ? 'Revoking…' : 'Revoke sessions'}</button></td></tr>
         {/each}
       </tbody>
     </table>
@@ -96,13 +121,13 @@ GET  /api/v1/submissions/:id/pdf</pre>
 
 {#if isAdmin()}
   <form class="card" onsubmit={resetData}>
-    <h2>Delete all application data</h2>
+    <h2>Delete all signing data</h2>
     <p>Permanently delete all templates, source PDFs, submissions, signatures, people, links, and activity. This also clears settings and API tokens and signs everyone out.</p>
     <p class="muted small">Backups, exports, and downloaded copies are kept. You can delete backup archives separately under Backups.</p>
     <label for="confirm-reset">Type <b>DELETE ALL DATA</b> to confirm.</label>
     <div class="row">
       <input id="confirm-reset" style="max-width:240px" bind:value={confirmation} autocomplete="off" disabled={resetting} />
-      <button type="submit" class="danger" disabled={resetting || confirmation !== 'DELETE ALL DATA'}>{resetting ? 'Deleting…' : 'Delete all application data'}</button>
+      <button type="submit" class="danger" disabled={resetting || confirmation !== 'DELETE ALL DATA'}>{resetting ? 'Deleting…' : 'Delete all signing data'}</button>
     </div>
     {#if resetError}<div class="error" role="alert">{resetError}</div>{/if}
   </form>

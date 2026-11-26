@@ -70,7 +70,8 @@
   <form class="card" onsubmit={save}>
     <h2>Schedule</h2>
     <p class="muted">
-      Each backup briefly pauses the app. Running requests finish, and new ones wait a moment instead of failing, so nothing is lost. During that pause a consistent snapshot of the database is taken, including all active login and signing sessions, together with the template PDFs. The pause usually lasts well under a second.
+      Each backup briefly pauses signing writes while it snapshots the signing database and template PDFs. Login and signing sessions are removed from the snapshot.
+      {#if data.includes_calendar}The archive also includes the calendar database.{/if}
     </p>
     <label class="inline" style="margin-bottom:12px"><input type="checkbox" bind:checked={cfg.enabled} /> Automatic backups enabled</label>
     <div class="field">
@@ -133,9 +134,17 @@
       </tbody>
     </table>
     <h3 style="margin-top:16px">Restore</h3>
+    <p>Restoring signs everyone out and invalidates old signing links and API tokens. A combined restore also invalidates scoped calendar tokens and feeds.</p>
+    {#if data.includes_calendar}
+      <p>Stop both services and mount the calendar volume for the restore. Replace the default volume name if you configured another one.</p>
+      <pre class="small">docker compose --profile calendar stop pdfsign calendar
+docker compose run --rm -v calendar_calendar-data:/calendar-data pdfsign pdfsign restore /backups/backup-file.zip --force --calendar-data-dir /calendar-data
+docker compose --profile calendar start calendar pdfsign</pre>
+    {:else}
     <pre class="small">docker compose stop pdfsign
-docker compose run --rm pdfsign pdfsign restore /backups/backup-YYYYMMDD-HHMMSS.zip --force
+docker compose run --rm pdfsign pdfsign restore /backups/backup-file.zip --force
 docker compose start pdfsign</pre>
+    {/if}
   </div>
 {:else}
   <p class="muted">Loading…</p>

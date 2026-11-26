@@ -1,0 +1,5 @@
+.env
+.bun-tmp
+node_modules
+dist
+data

@@ -11,10 +11,11 @@ A self-hosted alternative to DocuSeal, built for Discord communities.
 * **DocuSeal import:** templates (PDF + fields) and completed submissions (values + signature images) are pulled through the DocuSeal API, and the signed PDFs are rebuilt here. The import runs in the background with a progress bar. You can also keep DocuSeal's original signed PDFs.
 * **Activity log:** recent actions (templates, documents, people, signing, bot, import, export, backups) and every server error, filterable in the admin UI under **Activity**.
 * **Light and dark theme:** follows the operating system; the admin UI has a toggle.
-* **General links + QR codes:** one link per template for everyone, e.g. printed at the entrance. People scan it, type their name, and either sign on the spot or see that they already have a valid signature. A zip code is only needed when several people share the name, and it is collected once from first-time signers.
-* **Backups:** scheduled (start time + interval + retention) into a host folder. Writes pause briefly while a consistent snapshot of the database (including active sessions) and the template PDFs is taken. The pause grows with the database size.
-* **Discord bot:** handles event sign-up checks, equipment hand-outs, and relinking a lost account to a new one.
-* **Auth:** login goes through **authentik** (OIDC). Roles come from authentik groups. Bots use API tokens generated in the app. Only the personal signing pages (`/s/<token>`) and general links (`/p/<token>`) work without login.
+* **General links + QR codes:** one link per template for everyone, e.g. printed at the entrance. People scan it, type their name and zip code, and either sign on the spot or see that they already have a valid signature. The zip code must match the one on file, so a name alone is not enough to sign for someone.
+* **Backups:** scheduled snapshots of signing data and template PDFs, plus the calendar database when events are enabled. Restores invalidate credentials and signing links from the snapshot.
+* **Optional Discord bot:** handles waiver checks, equipment hand-outs, relinking a lost account, and opening authenticated event commands.
+* **Optional events:** schedule events, share RSVP links, publish a subscribable calendar, and manage events via a scoped API. Event records, RSVPs, calendar credentials, and event API keys use separate SQLite storage.
+* **Auth:** login goes through **authentik** (OIDC). Roles come from authentik groups. Public signing pages (`/s/<token>` and `/p/<token>`) use the signing-link flow.
 
 ```
 server/   Rust backend (axum, sqlx/SQLite, lopdf)
@@ -30,7 +31,19 @@ mkdir -p data export
 docker compose up -d --build pdfsign
 ```
 
-Put a TLS reverse proxy in front of port 8080 and set `PUBLIC_URL` to the public HTTPS URL. Session cookies are marked `Secure` when `PUBLIC_URL` starts with `https://`. The proxy must set `X-Forwarded-For`. The header is only believed from addresses in `TRUSTED_PROXIES` (default: loopback and private networks, which covers a proxy on the host or in Docker).
+Put a TLS reverse proxy in front of port 8080 and set `PUBLIC_URL` to the public HTTPS origin. Set `TRUSTED_PROXIES` to the exact proxy peer addresses as seen by pdfsign, and configure those proxies to set or append the client address to `X-Forwarded-For`. With the default empty list, every request uses the connecting peer's address for rate limiting and audit records. This can group all signers behind an unconfigured proxy under one limit.
+
+To run signing on its own, start the `pdfsign` service. Docker Compose starts the bot only when explicitly requested or when the `bot` profile is active.
+
+### Install pdfsign as a web app
+
+Open `/admin` on the HTTPS deployment and sign in. Install from your browser, then open **pdfsign** from your home screen or app launcher.
+
+- **iPhone** — In Safari, use **Share → Add to Home Screen**, enable **Open as Web App** if shown, and tap **Add**. Chrome also offers **Share → Add to Home Screen**.
+- **Android** — In Chrome, open the menu and choose **Install**. Depending on the Chrome version, it may be under **Add to Home screen** or **Install and create shortcut**.
+- **Desktop Chrome** — Select the install icon in the address bar or use **Menu → Cast, save and share → Install page as app**.
+
+The app opens the admin entry point. To sign a document, open the signing link you received.
 
 ### Prebuilt images
 
@@ -53,7 +66,7 @@ docker compose up -d --no-build pdfsign bot
 3. Create two groups and add your users to them:
    * `pdfsign-admins` – everything, including API tokens, DocuSeal import, export to disk and deleting data
    * `pdfsign-staff` – templates, documents, people, sending links, ZIP export
-   Users in neither group are refused after login. To use other names, set `OIDC_ADMIN_GROUP` / `OIDC_STAFF_GROUP`.
+   These two groups grant signing access. To use other names, set `OIDC_ADMIN_GROUP` / `OIDC_STAFF_GROUP`. An optional third group can grant event viewing and RSVP access.
 4. Put the values into `.env`:
    ```
    OIDC_ISSUER=https://auth.example.com/application/o/pdfsign/
@@ -61,21 +74,21 @@ docker compose up -d --no-build pdfsign bot
    OIDC_CLIENT_SECRET=...
    ```
 
-Roles are re-read from authentik on every login. Sessions last 12 hours.
+Use the exact HTTPS `issuer` in authentik's discovery document, including the trailing slash if present. Discovery endpoints must share that origin. pdfsign verifies the ID token signature with authentik's published signing key or the client secret for HS256. Sessions last 15 minutes and roles are checked again on login. For immediate offboarding, remove the user's authentik group access and select **Revoke sessions** under **API & export → Users**.
 
 ### 2. Discord bot
 
 1. Create an application and bot at <https://discord.com/developers/applications>. Under **Bot**, enable **Message Content Intent**. Install it to your server using the `bot` scope. Give it **View Channel** and **Send Messages** where you want it to answer commands or post staff notifications.
-2. Log into pdfsign as an admin. Go to **API & export → Generate token** and put the token in `PDFSIGN_API_KEY`.
+2. To enable signing commands, log into pdfsign as an admin. Go to **API & export → Generate token** and put the token in `PDFSIGN_API_KEY`. For an events-only bot, enable `EVENTS_ENABLED` and leave the signing API key blank.
 3. Set `DISCORD_TOKEN` to the Discord bot token and set the template slugs `EVENT_TEMPLATE` / `EQUIPMENT_TEMPLATE`. Set `DISCORD_GUILD_ID` to limit server commands to one server, or leave it blank to serve every server the bot joins.
-4. Run `docker compose up -d bot`, then type `!help` in Discord. Unknown `!` commands also show the help menu. On upgrade, the bot removes its previous pdfsign slash commands on startup.
+4. Run `docker compose up -d bot`, then type `!help` in Discord. Unknown `!` commands also show the help menu.
 
 The bot sends personal details and signing links by DM. Enable DMs from server members or use member commands in a direct message with the bot. Staff commands run in the server and send their results by DM. Staff can use an @mention or Discord user ID for a member argument.
 
 | Command | Who | What |
 | --- | --- | --- |
 | `!help` | everyone | Show the command menu |
-| `!register` | everyone | Open a private form to register or update your full name and ZIP code |
+| `!register` | everyone | Open a private form to register your full name and ZIP code. A registered name can only be changed by staff, and a ZIP code is only added when none is on file |
 | `!signup [event]` | everyone | Checks for a valid waiver. If there is none, you get a signing link |
 | *"Interested" on a Discord scheduled event* | everyone | Same as `!signup`, delivered by DM. Staff are notified in `NOTIFY_CHANNEL_ID` if DMs are closed |
 | `!equipment` | everyone | Opens your equipment form again to add items |
@@ -85,6 +98,45 @@ The bot sends personal details and signing links by DM. Enable DMs from server m
 | `!link-account <old-user-id> @new-member` | staff | Moves all data of a lost Discord account to the new one |
 
 Staff commands require the *Manage Server* permission. If `ADMIN_ROLE_IDS` is set, they require one of those roles instead, and *Manage Server* alone no longer counts.
+
+### 3. Event scheduling
+
+Set `EVENTS_ENABLED=true` in the root `.env`. Generate three distinct URL-safe secrets of at least 32 characters for `CALENDAR_ADMIN_TOKEN`, `CALENDAR_FEED_TOKEN`, and `CALENDAR_PDFSIGN_TOKEN`. Run `docker compose --profile calendar up -d --build calendar pdfsign bot` to start the combined deployment. Drop `bot` from the command if you only want the web apps.
+
+To use an existing standalone calendar, set `CALENDAR_URL` in pdfsign to the calendar origin reachable from the pdfsign container. Set the same `CALENDAR_PDFSIGN_TOKEN` on both services, restart the calendar, and start pdfsign and the bot with `docker compose up -d --build pdfsign bot`. Use HTTPS if the connection leaves a trusted private network.
+
+Open **Events** after logging in to pdfsign. Admins and staff can create, edit, and cancel events. To let community members view events and RSVP, create a group in Authentik and set `OIDC_EVENT_GROUP` to its name. This group grants access to events only.
+
+Set the bot's `PUBLIC_URL` to the public HTTPS address of pdfsign. These commands send an Authentik-protected link by DM. The browser uses the same session as the signing app and asks for confirmation before saving or cancelling an event.
+
+| Command | Action |
+| --- | --- |
+| `!event list` | Browse upcoming, in-progress, ended, and cancelled events |
+| `!event create` | Open the new event form |
+| `!event show <id>` | Open an event and RSVP |
+| `!event edit <id>` | Open the event editor |
+| `!event cancel <id>` | Review and confirm cancellation |
+
+The event ID is the last segment of its page URL. Use **Copy event link** to share a link with attendees. Timed events display in each visitor's browser time zone. The event-enabled bot checks the calendar connection before logging in and before sending event links. Signing-only deployments can leave events disabled. The existing Discord scheduled-event watcher continues to handle signing waivers for native Discord events.
+
+#### Calendar subscriptions
+
+An admin can generate and revoke a private iCalendar feed under **Events → Calendars & API**. Use **Subscribe by URL** or **Add by URL** in a calendar client. The feed includes scheduled events and their cancellations, with a 90-day history. Changes from either web app or API appear when the client next refreshes. Keep the URL private because it grants read access to all event titles, times, locations, and descriptions.
+
+#### Event integration API
+
+An admin can issue **Read-only** or **Read/write** event tokens under **Events → Calendars & API**. Send `Authorization: Bearer <event-token>` with each request.
+
+| Request | Effect |
+| --- | --- |
+| `GET /api/events/v1/events` | Paginated list. Optional `phase`, `limit` (1–100), and `offset`. Use `next_offset` from the response |
+| `GET /api/events/v1/events/{id}` | Event details, current phase, and aggregate RSVP counts |
+| `POST /api/events/v1/events` | Create an event using a write token |
+| `PUT /api/events/v1/events/{id}` | Replace event fields using a write token and the current `revision` |
+
+Create and update bodies use `title`, `starts_at`, `ends_at`, optional `description` and `location`, and `status` (`scheduled` by default or `cancelled`). Timed events use RFC 3339 with an offset, such as `2026-12-07T18:00:00+01:00`. For an all-day event, set `all_day: true` and use `YYYY-MM-DD` dates with an exclusive end. The returned `phase` is `upcoming`, `ongoing`, `ended`, or `cancelled`. On a `409 stale_revision`, fetch the latest record before retrying. Send the same `Idempotency-Key` when retrying a create. Reusing the key with different input returns `409`.
+
+The calendar service stores events, RSVPs, scoped credentials, and pending webhooks in `calendar.sqlite` in the calendar volume. Both apps read and write it through the calendar service. When events are enabled, pdfsign backups include this database.
 
 ### Setting up the two use cases
 
@@ -96,33 +148,46 @@ Staff commands require the *Manage Server* permission. If `ADMIN_ROLE_IDS` is se
 
 In the template editor, **General links & QR codes → Create link**, then **QR** → *Print poster*, *PNG* or *SVG*. Links can be disabled or given an expiry date; signed documents stay valid either way. Opening a link:
 
-1. The signer enters first and last name.
-2. Nobody with that name yet: they must enter their zip code, and a new person is created.
-3. Exactly one person with that name: they continue with that person.
-4. Several people with that name: the zip code picks the right one. An unknown zip code creates a new person. If one of the namesakes has no zip on file, the signer is asked to get staff help rather than the app guessing (the People page marks these with *same name · no zip!*).
+1. The signer enters first and last name and their zip code.
+2. A registered person with that name and zip code: they continue as that person.
+3. Nobody with that name and zip code: a new person is created. Each client can create at most 10 new people per 10 minutes.
+4. A person with that name but no zip code on file: the signer is asked to get staff help rather than the app guessing. Add the zip code under **People** (the People page marks namesakes without one with *same name · no zip!*).
 5. Valid signature already present: "You're all set". Otherwise they sign on the spot. On a shared tablet, *Done — next person* resets the page.
 
-Identification is limited to 100 requests per IP per 10 minutes, enough for 50 first-time signers using one request for their name and one for their zip code. General links are convenient but weaker than personal links: anyone who knows a name can see whether that person has a valid signature, and can sign that person's still-open document. Use personal Discord links where that matters (e.g. equipment).
+The signing page opened from a QR link uses a temporary `qr-…` address that ends with the two-hour signing session. It never shows the person's personal signing link.
+
+QR identification is limited to 100 requests per client per 10 minutes (IPv6 clients count per /64). Personal-link unlocks are limited to 50 per client per 10 minutes and the configured number of failed attempts per link. An existing locked submission also stays locked when opened through a QR link. Anyone with the shared link who knows a member's name and zip code can sign that person's pending document. Use personal Discord links for sensitive documents.
+
+Behind a reverse proxy, set `TRUSTED_PROXIES` to the proxy's address. Otherwise every visitor shares the proxy's address and its rate limit, and pdfsign logs a warning when proxied requests arrive.
 
 ### Backups
 
 Admins configure backups on the **Backups** page: folder, first run time, interval (hours or days) and how many to keep. With Docker, set `BACKUP_HOST_DIR` in `.env` (mounted at `/backups`) and `TZ` for the schedule's timezone.
 
-The backup folder must be writable by `PDFSIGN_UID`/`PDFSIGN_GID`. Backups cover the database and the template PDFs. Exports and DocuSeal originals in `./export` are not included.
+Use a private backup folder writable by `PDFSIGN_UID`/`PDFSIGN_GID`. Archives are created with mode `0600` on Unix. Use an owner-only ACL for a native Windows backup folder. Archives contain personal data. Exports and DocuSeal originals in `./export` require their own backups.
 
-Each run waits for in-flight requests to finish and holds new state-changing requests for the moment of the snapshot. They are delayed, not rejected. It then checkpoints the WAL and runs `VACUUM INTO`, which captures every user and signing session. Template PDFs are copied too, then the app resumes. The pause depends on the database size. The Backups page shows the last one. The snapshot is checked (SQLite integrity, all template PDFs present) before `backup-YYYYMMDD-HHMMSS.zip` is written. A manual run does not move the schedule. Day-based intervals stay on their days and start time across DST changes.
+Each run briefly holds signing writes while SQLite snapshots the database. The template PDFs that snapshot references are copied afterwards; a backup fails (retry it) if one of them is deleted in the meantime. User sessions, signer sessions, and pending OIDC logins are removed from the snapshot. If events are enabled, the calendar service must return a valid SQLite snapshot of at most 128 MiB. Each database snapshot is consistent independently. The app verifies database integrity and checks for missing template PDFs before publishing the ZIP. A manual backup leaves the schedule in place. Day-based intervals stay on their days and start time across DST changes.
 
-CLI: `pdfsign backup`. It runs in its own process and does not pause a running server. The database copy is still consistent. If a template is deleted during the copy, the check fails the backup and you run it again.
+Run `pdfsign backup` from the CLI. It uses a separate process, so a running service can continue writing. If a concurrent template change leaves the snapshot incomplete, the backup fails validation and can be retried.
 
-Restore:
+For a signing-only archive, stop pdfsign and restore the ZIP:
 
 ```bash
 docker compose stop pdfsign
-docker compose run --rm pdfsign pdfsign restore /backups/backup-YYYYMMDD-HHMMSS.zip --force
+docker compose run --rm pdfsign pdfsign restore /backups/backup-file.zip --force
 docker compose start pdfsign
 ```
 
-The archive is extracted into a staging folder in `DATA_DIR` and checked first. A broken archive leaves the current data untouched. The current database and template folder are then moved to `DATA_DIR/.pre-restore-<timestamp>`, and moved back if installing the restored copy fails. Delete that folder once the restored data is verified.
+For an archive that includes the calendar, stop both services and temporarily mount the calendar volume for the restore. Replace `calendar_calendar-data` if you configured `CALENDAR_VOLUME_NAME`. The restore user and calendar service must have access to the restored database. The default Compose UIDs match.
+
+```bash
+docker compose --profile calendar stop pdfsign calendar
+docker compose run --rm -v calendar_calendar-data:/calendar-data pdfsign \
+  pdfsign restore /backups/backup-file.zip --force --calendar-data-dir /calendar-data
+docker compose --profile calendar start calendar pdfsign
+```
+
+Only archives made by this pdfsign version can be restored. Pass `--signing-only` to restore just signing data from a combined archive. The restore validates all selected data before replacing live files and retains the previous data in private `.pre-restore-*` folders. Reissue signing API keys, personal links, and scoped calendar tokens or feeds after a restore. General links are disabled and must be re-enabled and shared using their new URLs. Pending calendar webhooks are discarded to avoid replaying changes.
 
 ### Import from DocuSeal
 
@@ -141,7 +206,7 @@ Pick templates and import them. How things map:
 * The import runs on the server in the background, so closing the page or a proxy timeout does not stop it. The page shows its progress and the result when you come back. DocuSeal rate limits (429) and temporary errors are retried.
 * Each submission (person, values, signing rounds) is written as one unit, so an interrupted import can simply be repeated. Importing again skips anything already imported. Imported IDs are qualified by the DocuSeal host, so two instances don't collide.
 * The result lists how many submissions were imported, already imported, not completed yet, or failed. Every warning and error is also written to the activity log (**Activity**, area `import`).
-* The API key is only sent to the configured DocuSeal host, not to other hosts that file URLs point to.
+* The API key stays on the exact configured origin. Each file destination and redirect must resolve to public addresses over HTTPS unless its exact origin is set in `DOCUSEAL_TRUSTED_ORIGINS`. Configure only private instances or storage endpoints you operate. Individual PDFs are limited to 32 MiB and API responses and signature images to 8 MiB.
 
 Then export the PDFs from the panel below the result.
 
@@ -159,7 +224,9 @@ All endpoints need `Authorization: Bearer <token>`.
 ```
 GET  /api/v1/templates
 GET  /api/v1/persons/{discord_id}                          person, linked accounts, documents
-PUT  /api/v1/persons/{discord_id}        {name, username, zip}  register / rename
+PUT  /api/v1/persons/{discord_id}        {name, username, zip}  register
+        A registered person keeps their name (409 already_registered for a different one)
+        and their ZIP code (only added when none is on file).
 GET  /api/v1/persons/{discord_id}/status?template={slug}   {registered, valid, valid_until, submission}
 POST /api/v1/links   {template, discord_id, name?, username?, force_new?}
      -> {url, status, valid, valid_until, created, ...}
@@ -178,12 +245,17 @@ GET  /api/v1/submissions/{id}/pdf
 | `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | – | authentik provider |
 | `OIDC_SCOPES` | `openid profile email` | |
 | `OIDC_ADMIN_GROUP` / `OIDC_STAFF_GROUP` | `pdfsign-admins` / `pdfsign-staff` | |
+| `OIDC_EVENT_GROUP` | unset | authentik group for viewing events and RSVPing |
+| `EVENTS_ENABLED` | `false` | Enables event commands, API, and feeds backed by the calendar service |
+| `CALENDAR_URL` | `http://calendar:3090` in Compose | Internal HTTP(S) origin for the calendar service |
+| `CALENDAR_PDFSIGN_TOKEN` | — | Shared service credential configured in both pdfsign and the calendar |
 | `DATA_DIR` / `EXPORT_DIR` | `/data` / `/export` | |
 | `MAX_NAME_ATTEMPTS` | `10` | Wrong names before a link is locked. Staff can unlock it or issue a new link |
 | `NO_AUDIT_PAGE` | unset | Set to `true` to leave out the audit page |
 | `BACKUP_DIR` | `/backups` | Default backup folder inside the container (compose mounts `BACKUP_HOST_DIR` there) |
 | `TZ` | `UTC` | Timezone for backup schedules |
-| `TRUSTED_PROXIES` | loopback + private networks | Comma-separated addresses / CIDRs whose `X-Forwarded-For` is believed (QR rate limit, audit IP). Empty: never |
+| `TRUSTED_PROXIES` | empty | Comma-separated peer addresses or narrow CIDRs trusted to supply `X-Forwarded-For` for rate limits and audit IPs |
+| `DOCUSEAL_TRUSTED_ORIGINS` | empty | Comma-separated exact origins allowed for private or plain HTTP DocuSeal and storage endpoints |
 
 ## Development
 

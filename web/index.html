@@ -6,13 +6,10 @@
     <meta name="robots" content="noindex" />
     <title>pdfsign</title>
     <meta name="color-scheme" content="light dark" />
-    <script>
-      // apply the theme chosen in the admin UI before the first paint (see lib/theme.svelte.ts)
-      try {
-        var t = localStorage.getItem('pdfsign_theme');
-        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
-      } catch (e) {}
-    </script>
+    <link rel="manifest" href="/pwa/manifest.webmanifest" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/pwa/apple-touch-icon.png" />
+    <!-- applies the theme chosen in the admin UI before the first paint (see lib/theme.svelte.ts) -->
+    <script src="/theme-init.js"></script>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232f5bd3'/><path d='M7 21c3-1 4-9 7-9s1 8 4 8 3-5 7-5' stroke='white' stroke-width='2.5' fill='none' stroke-linecap='round'/></svg>" />
   </head>
   <body>

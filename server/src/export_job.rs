@@ -1,8 +1,8 @@
 //! Exports that run in the background so the admin UI can show a progress bar: a disk
 //! export, or a ZIP that is built on the server and downloaded once it is ready.
 //!
-//! Jobs live in memory only. A finished job (and its ZIP) is dropped after its download or
-//! after [`KEEP`], whichever comes first.
+//! Jobs live in memory only; a ZIP is a temporary file. A finished job's ZIP is deleted
+//! after its download or after [`KEEP`], whichever comes first.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,6 +17,8 @@ use crate::util::*;
 
 /// How long a finished job (and an undownloaded ZIP) is kept.
 const KEEP: Duration = Duration::from_secs(30 * 60);
+/// Exports render every document, so only a few may run at once.
+const MAX_RUNNING: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -45,7 +47,7 @@ pub struct ExportJob {
     pub ready: bool,
     pub filename: Option<String>,
     #[serde(skip)]
-    zip: Option<Arc<Vec<u8>>>,
+    zip: Option<Arc<TempFile>>,
     #[serde(skip)]
     finished: Option<Instant>,
 }
@@ -63,6 +65,9 @@ fn prune(state: &AppState) {
 /// Starts an export and returns its job; poll [`get`] for progress.
 pub async fn start(state: &AppState, req: StartRequest, actor: &str) -> AppResult<ExportJob> {
     prune(state);
+    if state.export_jobs.lock().unwrap().values().filter(|j| j.running).count() >= MAX_RUNNING {
+        return Err(AppError::conflict("export_busy", "two exports are already running - wait for one to finish"));
+    }
     let template = match req.template.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         Some(t) => Some(service::get_template(&state.pool, t).await?),
         None => None,
@@ -168,7 +173,7 @@ pub fn get(state: &AppState, id: &str) -> AppResult<ExportJob> {
 }
 
 /// Hands out a finished ZIP once; the job keeps its report but no longer holds the archive.
-pub fn take_zip(state: &AppState, id: &str) -> AppResult<(String, Arc<Vec<u8>>)> {
+pub fn take_zip(state: &AppState, id: &str) -> AppResult<(String, Arc<TempFile>)> {
     let mut jobs = state.export_jobs.lock().unwrap();
     let j = jobs.get_mut(id).ok_or_else(|| AppError::not_found("export not found (it may have expired)"))?;
     let zip = j.zip.take().ok_or_else(|| AppError::not_found("this ZIP is not ready or was already downloaded"))?;

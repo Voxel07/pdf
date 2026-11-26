@@ -5,11 +5,10 @@
   let { token }: { token: string } = $props();
 
   let info = $state<{ template_name: string; description: string; label: string; validity_days: number | null } | null>(null);
-  let phase = $state<'loading' | 'name' | 'zip' | 'valid' | 'error'>('loading');
+  let phase = $state<'loading' | 'name' | 'valid' | 'error'>('loading');
   let error = $state('');
   let name = $state('');
   let zip = $state('');
-  let zipReason = $state<'duplicate' | 'new'>('new');
   let busy = $state(false);
   let validInfo = $state<{ person_name: string; valid_until: string | null } | null>(null);
 
@@ -29,18 +28,18 @@
     busy = true;
     error = '';
     try {
-      const r = await request('POST', `/api/public/p/${token}/identify`, { name, zip: phase === 'zip' ? zip : undefined });
+      const r = await request('POST', `/api/public/p/${token}/identify`, { name, zip });
       if (r.result === 'need_zip') {
-        zipReason = r.reason;
-        phase = 'zip';
+        error = 'Please enter your zip code.';
       } else if (r.result === 'valid') {
         validInfo = r;
         phase = 'valid';
       } else if (r.result === 'sign') {
-        sessionStorage.setItem(`pdfsign_session_${r.token}`, r.session);
-        sessionStorage.setItem(`pdfsign_zip_${r.token}`, zip.trim());
-        sessionStorage.setItem(`pdfsign_return_${r.token}`, location.pathname);
-        navigate(`/s/${r.token}`);
+        // the handle stands in for a signing link and ends with this session
+        sessionStorage.setItem(`pdfsign_session_${r.handle}`, r.session);
+        sessionStorage.setItem(`pdfsign_zip_${r.handle}`, zip.trim());
+        sessionStorage.setItem(`pdfsign_return_${r.handle}`, location.pathname);
+        navigate(`/s/${r.handle}`);
       }
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -80,23 +79,15 @@
           <div class="field">
             <label for="nm">Your full name</label>
             <!-- svelte-ignore a11y_autofocus -->
-            <input id="nm" bind:value={name} autocomplete="name" placeholder="First and last name" required minlength="3" disabled={phase === 'zip'} autofocus />
+            <input id="nm" bind:value={name} autocomplete="name" placeholder="First and last name" required minlength="3" autofocus />
           </div>
-          {#if phase === 'zip'}
-            <div class="field">
-              <label for="zip">Zip code</label>
-              <!-- svelte-ignore a11y_autofocus -->
-              <input id="zip" bind:value={zip} autocomplete="postal-code" inputmode="text" required minlength="3" maxlength="10" autofocus />
-              <p class="small muted" style="margin-top:4px">
-                {zipReason === 'duplicate'
-                  ? 'More than one person with this name is registered. Your zip code tells us which one you are.'
-                  : "You're signing for the first time. Your zip code helps us tell people with the same name apart."}
-              </p>
-            </div>
-          {/if}
+          <div class="field">
+            <label for="zip">Zip code</label>
+            <input id="zip" bind:value={zip} autocomplete="postal-code" inputmode="text" required minlength="3" maxlength="10" />
+            <p class="small muted" style="margin-top:4px">Your zip code confirms who you are. Use the one you registered with.</p>
+          </div>
           {#if error}<div class="error">{error}</div>{/if}
           <div class="row">
-            {#if phase === 'zip'}<button type="button" onclick={reset}>Back</button>{/if}
             <button class="primary grow" type="submit" disabled={busy}>{busy ? 'Checking…' : 'Continue'}</button>
           </div>
         </form>

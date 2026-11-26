@@ -1,11 +1,14 @@
 //! Public signing endpoints. Access requires the random link token plus a check of the signer's
 //! registered name. After the name check a short-lived session token is issued (sent back in
 //! the `X-Session` header).
+//!
+//! General (QR) links never hand out the personal link token: their session comes with a
+//! `qr-...` handle that stands in for the token in these routes and ends with the session.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -23,19 +26,38 @@ use crate::util::*;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/s/{token}", get(info))
-        .route("/s/{token}/unlock", post(unlock))
+        .route("/s/{token}/unlock", post(unlock).layer(DefaultBodyLimit::max(4096)))
         .route("/s/{token}/form", get(form))
         .route("/s/{token}/template.pdf", get(template_pdf))
         .route("/s/{token}/submit", post(submit))
         .route("/s/{token}/signed.pdf", get(signed_pdf))
         .route("/p/{token}", get(link_info))
-        .route("/p/{token}/identify", post(link_identify))
+        .route("/p/{token}/identify", post(link_identify).layer(DefaultBodyLimit::max(4096)))
 }
 
 const SESSION_HOURS: i64 = 2;
 
+const HANDLE_PREFIX: &str = "qr-";
+
+/// The submission behind a page address: a personal link token, or the handle of a live
+/// general-link session.
+async fn resolve_link<'e>(ex: impl sqlx::SqliteExecutor<'e>, token: &str) -> AppResult<Submission> {
+    if !token.starts_with(HANDLE_PREFIX) {
+        return submission_by_token(ex, token).await;
+    }
+    sqlx::query_as(
+        "SELECT s.* FROM submissions s JOIN signer_sessions ss ON ss.submission_id = s.id
+         WHERE ss.handle = ? AND ss.expires_at > ?",
+    )
+    .bind(token)
+    .bind(Utc::now().to_rfc3339())
+    .fetch_optional(ex)
+    .await?
+    .ok_or_else(|| AppError::new(StatusCode::GONE, "session_ended", "this signing session has ended - scan the code again to continue"))
+}
+
 async fn info(State(st): State<AppState>, Path(token): Path<String>) -> AppResult<Json<Value>> {
-    let sub = submission_by_token(&st.pool, &token).await?;
+    let sub = resolve_link(&st.pool, &token).await?;
     let t = get_template(&st.pool, &sub.template_id).await?;
     Ok(Json(json!({
         "template_name": t.name,
@@ -52,25 +74,30 @@ struct UnlockReq {
 async fn unlock(
     State(st): State<AppState>,
     Path(token): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<UnlockReq>,
 ) -> AppResult<Json<Value>> {
-    let sub = submission_by_token(&st.pool, &token).await?;
-    if sub.status == "revoked" {
-        return Err(AppError::new(StatusCode::GONE, "revoked", "this link has been revoked"));
+    let ip = client_ip(&st, &headers, addr);
+    limit_attempts(&st, "unlock", &ip, 50)?;
+    if token.starts_with(HANDLE_PREFIX) {
+        return Err(AppError::new(StatusCode::GONE, "session_ended", "this signing session has ended - scan the code again to continue"));
     }
-    if sub.failed_attempts >= st.cfg.max_name_attempts {
-        return Err(AppError::new(StatusCode::LOCKED, "locked", "too many wrong attempts - please ask for a new link"));
+    if req.name.len() > 1024 {
+        return Err(AppError::bad_request("name is too long"));
     }
-    let person = get_person(&st.pool, &sub.person_id).await?;
+    let mut tx = service::begin_write(&st.pool).await?;
+    let sub = submission_by_token(&mut *tx, &token).await?;
+    check_signing_link(&st, &sub)?;
+    let person = get_person(&mut *tx, &sub.person_id).await?;
     if normalize_name(&req.name) != normalize_name(&person.name) {
         sqlx::query("UPDATE submissions SET failed_attempts = failed_attempts + 1 WHERE id = ?")
             .bind(&sub.id)
-            .execute(&st.pool)
+            .execute(&mut *tx)
             .await?;
-        // slow down guessing a bit
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        tx.commit().await?;
         let left = st.cfg.max_name_attempts - sub.failed_attempts - 1;
-        if left <= 0 {
+        if left == 0 {
             let t = get_template(&st.pool, &sub.template_id).await?;
             let msg = format!("signing link for '{}' of {} locked after too many wrong names", t.name, person.name);
             crate::activity::warn(&st.pool, "signing", None, msg).await;
@@ -82,22 +109,34 @@ async fn unlock(
         ));
     }
     if sub.failed_attempts > 0 {
-        sqlx::query("UPDATE submissions SET failed_attempts = 0 WHERE id = ?").bind(&sub.id).execute(&st.pool).await?;
+        sqlx::query("UPDATE submissions SET failed_attempts = 0 WHERE id = ?").bind(&sub.id).execute(&mut *tx).await?;
     }
-    let (session, expires) = issue_session(&st, &sub.id).await?;
+    let (session, expires) = issue_session(&mut tx, &sub.id, None).await?;
+    tx.commit().await?;
     let form = build_form(&st, &sub).await?;
     Ok(Json(json!({ "session": session, "expires_at": expires, "form": form })))
 }
 
-async fn issue_session(st: &AppState, submission_id: &str) -> AppResult<(String, String)> {
+fn check_signing_link(st: &AppState, sub: &Submission) -> AppResult<()> {
+    if sub.status == "revoked" {
+        return Err(AppError::new(StatusCode::GONE, "revoked", "this link has been revoked"));
+    }
+    if sub.failed_attempts >= st.cfg.max_name_attempts {
+        return Err(AppError::new(StatusCode::LOCKED, "locked", "too many wrong attempts - please ask for a new link"));
+    }
+    Ok(())
+}
+
+async fn issue_session(tx: &mut sqlx::SqliteConnection, submission_id: &str, handle: Option<&str>) -> AppResult<(String, String)> {
     let session = random_token(32);
     let expires = (Utc::now() + Duration::hours(SESSION_HOURS)).to_rfc3339();
-    sqlx::query("DELETE FROM signer_sessions WHERE expires_at < ?").bind(Utc::now().to_rfc3339()).execute(&st.pool).await?;
-    sqlx::query("INSERT INTO signer_sessions (token_hash, submission_id, expires_at) VALUES (?, ?, ?)")
+    sqlx::query("DELETE FROM signer_sessions WHERE expires_at < ?").bind(Utc::now().to_rfc3339()).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO signer_sessions (token_hash, submission_id, expires_at, handle) VALUES (?, ?, ?, ?)")
         .bind(sha256_hex(&session))
         .bind(submission_id)
         .bind(&expires)
-        .execute(&st.pool)
+        .bind(handle)
+        .execute(&mut *tx)
         .await?;
     Ok((session, expires))
 }
@@ -111,7 +150,7 @@ async fn session_submission(st: &AppState, token: &str, headers: &HeaderMap) -> 
 /// Like [`session_submission`], also returning the session's hash for rechecks.
 async fn session_submission_hash(st: &AppState, token: &str, headers: &HeaderMap) -> AppResult<(Submission, String)> {
     let session = headers.get("x-session").and_then(|v| v.to_str().ok()).map(String::from).ok_or_else(AppError::unauthorized)?;
-    let sub = submission_by_token(&st.pool, token).await?;
+    let sub = resolve_link(&st.pool, token).await?;
     let hash = sha256_hex(&session);
     let row: Option<(String, String)> =
         sqlx::query_as("SELECT submission_id, expires_at FROM signer_sessions WHERE token_hash = ?")
@@ -207,7 +246,17 @@ struct SubmitReq {
 }
 
 fn client_ip(st: &AppState, headers: &HeaderMap, addr: SocketAddr) -> String {
+    if headers.contains_key("x-forwarded-for") && !st.cfg.trusted_proxies.iter().any(|n| n.contains(addr.ip())) {
+        st.warn_untrusted_forwarding();
+    }
     crate::util::client_ip(headers, Some(addr.ip()), &st.cfg.trusted_proxies)
+}
+
+fn limit_attempts(st: &AppState, action: &str, ip: &str, max: usize) -> AppResult<()> {
+    if !st.rate_ok(&format!("{action}:{}", crate::state::rate_key(ip)), max) {
+        return Err(AppError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "too many attempts - please wait a few minutes"));
+    }
+    Ok(())
 }
 
 async fn submit(
@@ -223,7 +272,7 @@ async fn submit(
     let ip = client_ip(&st, &headers, addr);
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let sub = submit_round(
-        &st.pool,
+        &st,
         &sub,
         &t,
         &person,
@@ -243,9 +292,12 @@ async fn submit(
 async fn signed_pdf(
     State(st): State<AppState>,
     Path(token): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
     let sub = session_submission(&st, &token, &headers).await?;
+    // every download renders the PDF anew
+    limit_attempts(&st, "pdf", &client_ip(&st, &headers, addr), 60)?;
     let (name, bytes) = render_submission(&st, &sub).await?;
     Ok(pdf_response(bytes, &name, false))
 }
@@ -253,10 +305,10 @@ async fn signed_pdf(
 // ---------------------------------------------------------------------------------------
 // General links (QR codes): identify by name (+ zip if ambiguous), then sign on the spot.
 
-async fn active_link(st: &AppState, token: &str) -> AppResult<PublicLink> {
+async fn active_link<'e>(ex: impl sqlx::SqliteExecutor<'e>, token: &str) -> AppResult<PublicLink> {
     let link: PublicLink = sqlx::query_as("SELECT * FROM public_links WHERE token = ?")
         .bind(token)
-        .fetch_optional(&st.pool)
+        .fetch_optional(ex)
         .await?
         .ok_or_else(|| AppError::not_found("this link is invalid"))?;
     let expired = link.expires_at.as_deref().and_then(parse_ts).is_some_and(|e| e <= Utc::now());
@@ -267,7 +319,7 @@ async fn active_link(st: &AppState, token: &str) -> AppResult<PublicLink> {
 }
 
 async fn link_info(State(st): State<AppState>, Path(token): Path<String>) -> AppResult<Json<Value>> {
-    let link = active_link(&st, &token).await?;
+    let link = active_link(&st.pool, &token).await?;
     let t = get_template(&st.pool, &link.template_id).await?;
     if t.archived {
         return Err(AppError::new(StatusCode::GONE, "inactive", "this document is no longer available"));
@@ -290,19 +342,20 @@ async fn link_identify(
 ) -> AppResult<Json<Value>> {
     let ip = client_ip(&st, &headers, addr);
     // A first-time signer uses two requests: one for the name and one with the ZIP code.
-    if !st.rate_ok(&format!("identify:{ip}"), 100, std::time::Duration::from_secs(600)) {
-        return Err(AppError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "too many attempts - please wait a few minutes"));
-    }
-    let link = active_link(&st, &token).await?;
+    limit_attempts(&st, "identify", &ip, 100)?;
+    let link = active_link(&st.pool, &token).await?;
     let t = get_template(&st.pool, &link.template_id).await?;
     if t.archived {
         return Err(AppError::new(StatusCode::GONE, "inactive", "this document is no longer available"));
     }
     let person = match identify_by_name(&st.pool, &req.name, req.zip.as_deref()).await? {
-        Identified::NeedZip(duplicate) => {
-            return Ok(Json(json!({ "result": "need_zip", "reason": if duplicate { "duplicate" } else { "new" } })));
-        }
+        Identified::NeedZip => return Ok(Json(json!({ "result": "need_zip", "reason": "verify" }))),
         Identified::Person(p) => p,
+        Identified::New(name, zip) => {
+            // first-time signers become new people; bound how many one client can create
+            limit_attempts(&st, "qr-new", &ip, 10)?;
+            create_person(&st.pool, &name, None, Some(&zip)).await?
+        }
     };
     let subs: Vec<Submission> = sqlx::query_as(
         "SELECT * FROM submissions WHERE person_id = ? AND template_id = ? AND status != 'revoked' ORDER BY created_at DESC",
@@ -319,8 +372,14 @@ async fn link_identify(
     }
     // reuses the open document or creates one, atomically with concurrent bot / QR requests
     let (sub, _) = find_or_create_submission(&st.pool, &t, &person, false, Some(&format!("link:{}", link.id))).await?;
-    sqlx::query("UPDATE public_links SET uses = uses + 1 WHERE id = ?").bind(&link.id).execute(&st.pool).await?;
-    let (session, _) = issue_session(&st, &sub.id).await?;
-    tracing::info!("general link {} opened by {} ({ip})", link.id, person.name);
-    Ok(Json(json!({ "result": "sign", "token": sub.token, "session": session, "person_name": person.name })))
+    let mut tx = service::begin_write(&st.pool).await?;
+    active_link(&mut *tx, &token).await?;
+    let sub = submission_by_token(&mut *tx, &sub.token).await?;
+    check_signing_link(&st, &sub)?;
+    let handle = format!("{HANDLE_PREFIX}{}", random_token(32));
+    let (session, _) = issue_session(&mut tx, &sub.id, Some(&handle)).await?;
+    sqlx::query("UPDATE public_links SET uses = uses + 1 WHERE id = ?").bind(&link.id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    tracing::info!("general link {} opened for submission {}", link.id, sub.id);
+    Ok(Json(json!({ "result": "sign", "handle": handle, "session": session, "person_name": person.name })))
 }

@@ -38,9 +38,9 @@ function toLogin(): never {
   throw new ApiError(401, 'unauthorized', 'Redirecting to login…');
 }
 
-async function adminReq<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function adminReq<T>(method: string, path: string, body?: unknown, headers?: Record<string, string>): Promise<T> {
   try {
-    return await request<T>(method, `/api/admin${path}`, body);
+    return await request<T>(method, `/api/admin${path}`, body, headers);
   } catch (e) {
     if (e instanceof ApiError && e.status === 401) toLogin();
     throw e;
@@ -49,11 +49,10 @@ async function adminReq<T>(method: string, path: string, body?: unknown): Promis
 
 export const admin = {
   get: <T = any>(path: string) => adminReq<T>('GET', path),
-  post: <T = any>(path: string, body?: unknown) => adminReq<T>('POST', path, body ?? {}),
+  post: <T = any>(path: string, body?: unknown, headers?: Record<string, string>) => adminReq<T>('POST', path, body ?? {}, headers),
   put: <T = any>(path: string, body: unknown) => adminReq<T>('PUT', path, body),
   del: <T = any>(path: string, body?: unknown) => adminReq<T>('DELETE', path, body),
   blob: (path: string) => adminReq<Blob>('GET', path),
-  headers: (): Record<string, string> => ({}),
 };
 
 export interface CurrentUser {
@@ -61,7 +60,7 @@ export interface CurrentUser {
   username: string;
   name: string;
   email: string | null;
-  role: 'admin' | 'staff';
+  role: 'admin' | 'staff' | 'attendee';
 }
 
 export async function downloadBlob(blob: Blob, filename: string) {
@@ -75,21 +74,9 @@ export async function downloadBlob(blob: Blob, filename: string) {
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
-export async function openBlob(blob: Blob) {
-  const url = URL.createObjectURL(blob);
-  window.open(url, '_blank');
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
-}
-
-/** Downloads an admin file and returns the response headers (e.g. `x-export-failed`). */
-export async function adminDownload(path: string, fallbackName: string): Promise<Headers> {
-  const res = await fetch(`/api/admin${path}`);
-  if (res.status === 401) toLogin();
-  if (!res.ok) return handle(res);
-  const cd = res.headers.get('content-disposition') ?? '';
-  const m = /filename="([^"]+)"/.exec(cd);
-  await downloadBlob(await res.blob(), m?.[1] ?? fallbackName);
-  return res.headers;
+export async function adminDownload(path: string, fallbackName: string): Promise<void> {
+  const { blob, filename } = await adminFetch(path, fallbackName);
+  await downloadBlob(blob, filename);
 }
 
 /** Fetches an admin file as a blob together with the file name the server suggests. */

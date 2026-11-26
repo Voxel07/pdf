@@ -16,6 +16,20 @@ pub struct AppError {
 
 pub type AppResult<T> = Result<T, AppError>;
 
+pub async fn read_limited(mut response: reqwest::Response, limit: usize) -> anyhow::Result<Vec<u8>> {
+    if response.content_length().is_some_and(|length| length > limit as u64) {
+        anyhow::bail!("upstream response exceeds the size limit");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(reqwest::Error::without_url)? {
+        if chunk.len() > limit - body.len() {
+            anyhow::bail!("upstream response exceeds the size limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 impl AppError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self { status, code, message: message.into() }
@@ -36,7 +50,14 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let mut res = (self.status, Json(json!({ "error": self.message, "code": self.code }))).into_response();
+        // Internal failures carry database, file and upstream details that clients must not
+        // see; staff find them in the activity log (see `activity::record_errors`).
+        let message = if self.status == StatusCode::INTERNAL_SERVER_ERROR {
+            "Internal server error. Staff can find the details in the activity log."
+        } else {
+            self.message.as_str()
+        };
+        let mut res = (self.status, Json(json!({ "error": message, "code": self.code }))).into_response();
         if self.status.is_server_error() {
             // picked up by `activity::record_errors`, which also writes the server log line
             res.extensions_mut().insert(crate::activity::FailedRequest(format!("{}: {}", self.code, self.message)));
@@ -64,6 +85,55 @@ impl From<std::io::Error> for AppError {
     fn from(e: std::io::Error) -> Self {
         AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "io", e.to_string())
     }
+}
+
+/// A file that is deleted when the last owner drops it (export archives).
+#[derive(Debug)]
+pub struct TempFile(pub std::path::PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0) && e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("could not remove {}: {e}", self.0.display());
+        }
+    }
+}
+
+/// An `AsyncRead` that keeps `K` alive until the reader is dropped (e.g. a [`TempFile`]
+/// that must outlive the download streaming it).
+struct KeepAlive<R, K> {
+    inner: R,
+    _keep: K,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin, K: Unpin> tokio::io::AsyncRead for KeepAlive<R, K> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+/// Streams a file as a download instead of reading it into memory.
+pub async fn download_response(
+    path: &std::path::Path, content_type: &str, filename: &str, keep: impl Send + Sync + Unpin + 'static,
+    extra: Vec<(axum::http::HeaderName, String)>,
+) -> AppResult<Response> {
+    use axum::http::header;
+    let file = tokio::fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(KeepAlive { inner: file, _keep: keep }));
+    let mut res = Response::new(body);
+    let h = res.headers_mut();
+    h.insert(header::CONTENT_TYPE, content_type.parse().map_err(|_| anyhow::anyhow!("invalid content type"))?);
+    h.insert(header::CONTENT_LENGTH, len.into());
+    h.insert(header::CACHE_CONTROL, axum::http::HeaderValue::from_static("private, no-store"));
+    let disposition = format!("attachment; filename=\"{}\"", filename.replace(|c: char| c == '"' || c == '\\' || c.is_control(), ""));
+    h.insert(header::CONTENT_DISPOSITION, disposition.parse().map_err(|_| anyhow::anyhow!("invalid file name"))?);
+    for (name, value) in extra {
+        h.insert(name, value.parse().map_err(|_| anyhow::anyhow!("invalid header"))?);
+    }
+    Ok(res)
 }
 
 const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
@@ -189,29 +259,26 @@ pub fn parse_nets(s: &str) -> Result<Vec<IpNet>, String> {
     s.split(',').filter(|p| !p.trim().is_empty()).map(str::parse).collect()
 }
 
-/// The client address of a request. `X-Forwarded-For` / `X-Real-IP` are only believed when
+/// The client address of a request. `X-Forwarded-For` is only believed when
 /// the connecting peer is a trusted proxy; then the rightmost forwarded address that is not
 /// itself a trusted proxy is used (entries left of it can be set by the client).
 pub fn client_ip(headers: &axum::http::HeaderMap, peer: Option<std::net::IpAddr>, trusted: &[IpNet]) -> String {
     let is_trusted = |ip: std::net::IpAddr| trusted.iter().any(|n| n.contains(ip));
     let Some(peer) = peer else { return String::new() };
     if !is_trusted(peer) {
-        return peer.to_string();
+        return peer.to_canonical().to_string();
     }
-    let forwarded: Vec<std::net::IpAddr> = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .filter_map(|p| p.trim().parse().ok())
-        .collect();
-    if let Some(ip) = forwarded.iter().rev().find(|ip| !is_trusted(**ip)).or(forwarded.first()) {
-        return ip.to_string();
+    let forwarded = headers.get_all("x-forwarded-for").iter().collect::<Vec<_>>();
+    for value in forwarded.into_iter().rev() {
+        let Ok(value) = value.to_str() else { break };
+        for entry in value.rsplit(',') {
+            let Ok(ip) = entry.trim().parse::<std::net::IpAddr>() else { return peer.to_string() };
+            if !is_trusted(ip) {
+                return ip.to_canonical().to_string();
+            }
+        }
     }
-    if let Some(ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<std::net::IpAddr>().ok()) {
-        return ip.to_string();
-    }
-    peer.to_string()
+    peer.to_canonical().to_string()
 }
 
 #[cfg(test)]
@@ -230,6 +297,10 @@ mod tests {
         assert_eq!(client_ip(&h, Some("::ffff:10.1.2.3".parse().unwrap()), &trusted), "1.2.3.4");
         // nothing trusted
         assert_eq!(client_ip(&h, Some("127.0.0.1".parse().unwrap()), &[]), "127.0.0.1");
+        h.insert("x-forwarded-for", "6.6.6.6, invalid".parse().unwrap());
+        assert_eq!(client_ip(&h, Some("127.0.0.1".parse().unwrap()), &trusted), "127.0.0.1");
+        h.insert("x-forwarded-for", "10.0.0.4, 10.0.0.5".parse().unwrap());
+        assert_eq!(client_ip(&h, Some("127.0.0.1".parse().unwrap()), &trusted), "127.0.0.1");
         assert!(parse_nets("10.0.0.0/33").is_err());
         assert!(parse_nets("").unwrap().is_empty());
     }

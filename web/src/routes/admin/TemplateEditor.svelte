@@ -33,7 +33,7 @@
   async function load() {
     t = await admin.get<Template>(`/templates/${id}`);
     currentSection = t.sections[0]?.id ?? 0;
-    doc = await loadPdf(`/api/admin/templates/${id}/pdf`, admin.headers());
+    doc = await loadPdf(`/api/admin/templates/${id}/pdf`);
   }
   load().catch((e) => (error = String(e)));
 

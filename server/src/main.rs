@@ -2,10 +2,12 @@ mod activity;
 mod auth;
 mod backup;
 mod docuseal;
+mod events;
 mod export_job;
 mod models;
 mod pdf;
 mod routes;
+mod security;
 mod service;
 mod state;
 #[cfg(test)]
@@ -52,6 +54,9 @@ struct Cli {
     /// authentik group granting the staff role (templates, documents, people).
     #[arg(long, env = "OIDC_STAFF_GROUP", default_value = "pdfsign-staff", global = true)]
     oidc_staff_group: String,
+    /// Optional authentik group granting event viewing and RSVP access.
+    #[arg(long, env = "OIDC_EVENT_GROUP", global = true)]
+    oidc_event_group: Option<String>,
     /// Default folder for backups (mount a host folder here).
     #[arg(long, env = "BACKUP_DIR", global = true)]
     backup_dir: Option<PathBuf>,
@@ -63,12 +68,17 @@ struct Cli {
     /// Disable the audit-trail page appended to generated PDFs.
     #[arg(long, env = "NO_AUDIT_PAGE", global = true)]
     no_audit_page: bool,
-    /// Comma-separated proxy addresses / networks whose X-Forwarded-For header is trusted
+    /// Enable optional event scheduling through the calendar service.
+    #[arg(long, env = "EVENTS_ENABLED", global = true)]
+    events_enabled: bool,
+    #[arg(long, env = "CALENDAR_URL", global = true, value_parser = parse_calendar_url)]
+    calendar_url: Option<reqwest::Url>,
+    /// Comma-separated addresses or narrow CIDRs of the actual reverse proxies
     /// (client IP for the QR rate limit and the audit page). Empty: never trust it.
     #[arg(
         long,
         env = "TRUSTED_PROXIES",
-        default_value = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7",
+        default_value = "",
         global = true
     )]
     trusted_proxies: String,
@@ -105,7 +115,31 @@ enum Cmd {
         /// Overwrite an existing database.
         #[arg(long)]
         force: bool,
+        /// Directory holding calendar.sqlite. Stop the calendar service before restoring it.
+        #[arg(long, conflicts_with = "signing_only")]
+        calendar_data_dir: Option<PathBuf>,
+        /// Restore only signing data from an archive that also contains calendar data.
+        #[arg(long)]
+        signing_only: bool,
     },
+}
+
+fn parse_calendar_url(value: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(value).map_err(|err| err.to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none()
+        || !url.username().is_empty() || url.password().is_some()
+        || url.path() != "/" || url.query().is_some() || url.fragment().is_some()
+    {
+        return Err("CALENDAR_URL must be an HTTP(S) origin without credentials".into());
+    }
+    Ok(url)
+}
+
+/// Export and backup folders as absolute paths. The admin UI refuses relative output
+/// folders (see `service::check_output_dir`), so a relative `DATA_DIR`, `EXPORT_DIR` or
+/// `BACKUP_DIR` is resolved against the working directory once at startup.
+pub(crate) fn output_dir(dir: PathBuf) -> Result<PathBuf> {
+    std::path::absolute(&dir).map_err(|e| anyhow::anyhow!("resolving {}: {e}", dir.display()))
 }
 
 #[tokio::main]
@@ -114,34 +148,48 @@ async fn main() -> Result<()> {
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info,sqlx=warn,tower_http=info".into()))
         .init();
     let cli = Cli::parse();
-    if let Some(Cmd::Restore { archive, force }) = &cli.cmd {
-        let previous = backup::restore(archive, &cli.data_dir, *force).await?;
+    if let Some(Cmd::Restore { archive, force, calendar_data_dir, signing_only }) = &cli.cmd {
+        let result = backup::restore(archive, &cli.data_dir, calendar_data_dir.as_deref(), *signing_only, *force).await?;
         println!("restored {} into {}", archive.display(), cli.data_dir.display());
-        if let Some(p) = previous {
-            println!("the previous data was moved to {} - delete it once the restore is verified", p.display());
+        if result.calendar_restored {
+            println!("calendar restored into {}", calendar_data_dir.as_ref().unwrap().display());
         }
+        for previous in [result.signing_previous, result.calendar_previous].into_iter().flatten() {
+            println!("previous data kept in {}", previous.display());
+        }
+        println!("Sessions, API keys, and old signing links are invalid. Reissue any credentials and links you still need.");
         return Ok(());
     }
+    anyhow::ensure!(cli.max_name_attempts > 0, "MAX_NAME_ATTEMPTS must be positive");
     let cfg = Config {
-        backup_dir: cli.backup_dir.clone().unwrap_or_else(|| cli.data_dir.join("backups")),
-        export_dir: cli.export_dir.clone().unwrap_or_else(|| cli.data_dir.join("export")),
+        backup_dir: output_dir(cli.backup_dir.clone().unwrap_or_else(|| cli.data_dir.join("backups")))?,
+        export_dir: output_dir(cli.export_dir.clone().unwrap_or_else(|| cli.data_dir.join("export")))?,
         data_dir: cli.data_dir,
-        public_url: cli.public_url,
         oidc: match (cli.oidc_issuer, cli.oidc_client_id, cli.oidc_client_secret) {
-            (Some(issuer), Some(client_id), Some(client_secret)) if !issuer.is_empty() => Some(auth::OidcConfig {
-                issuer,
-                client_id,
-                client_secret,
-                scopes: cli.oidc_scopes,
-                admin_group: cli.oidc_admin_group,
-                staff_group: cli.oidc_staff_group,
-                discovery: Default::default(),
-            }),
+            (Some(issuer), Some(client_id), Some(client_secret)) if !issuer.is_empty() && !client_id.is_empty() && !client_secret.is_empty() => {
+                auth::validate_issuer(&issuer)?;
+                auth::validate_public_url(&cli.public_url)?;
+                Some(auth::OidcConfig {
+                    issuer,
+                    client_id,
+                    client_secret,
+                    scopes: cli.oidc_scopes,
+                    admin_group: cli.oidc_admin_group,
+                    staff_group: cli.oidc_staff_group,
+                    event_group: cli.oidc_event_group.filter(|group| !group.is_empty()),
+                    discovery: Default::default(),
+                    jwks: Default::default(),
+                })
+            }
             _ => None,
         },
+        public_url: cli.public_url,
         web_dir: cli.web_dir,
         max_name_attempts: cli.max_name_attempts,
         audit_page: !cli.no_audit_page,
+        events_enabled: cli.events_enabled,
+        calendar_url: cli.calendar_url,
+        calendar_pdfsign_token: std::env::var("CALENDAR_PDFSIGN_TOKEN").ok(),
         trusted_proxies: util::parse_nets(&cli.trusted_proxies).map_err(|e| anyhow::anyhow!("TRUSTED_PROXIES: {e}"))?,
     };
     let state = AppState::new(cfg).await?;
@@ -182,10 +230,7 @@ pub fn version() -> String {
     std::env::var("PDFSIGN_VERSION").ok().filter(|v| !v.is_empty() && v != "dev").unwrap_or_else(|| format!("{}-dev", env!("CARGO_PKG_VERSION")))
 }
 
-async fn serve(state: AppState, bind: SocketAddr) -> Result<()> {
-    if state.cfg.oidc.is_none() {
-        tracing::warn!("OIDC is not configured - nobody can log in to the admin UI");
-    }
+fn app_router(state: AppState) -> Router {
     let index = state.cfg.web_dir.join("index.html");
     // Static assets and the public signing pages (/s/<token>, /p/<token>) are served without
     // login; /admin is guarded.
@@ -198,13 +243,29 @@ async fn serve(state: AppState, bind: SocketAddr) -> Result<()> {
         .nest("/auth", auth::router())
         .nest("/api/admin", routes::admin::router())
         .nest("/api/v1", routes::api::router())
-        .nest("/api/public", routes::public::router())
+        .nest("/api/public", routes::public::router());
+    // the event routes share every layer below (body limit, write gate, error log, headers)
+    let app = if state.cfg.events_enabled {
+        app.merge(events::router(&state))
+    } else {
+        app.merge(events::disabled_router())
+    };
+    let app = app
         .fallback_service(spa)
         .layer(axum::middleware::from_fn_with_state(state.clone(), backup::write_gate))
         .layer(axum::middleware::from_fn_with_state(state.clone(), activity::record_errors))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), security::same_origin))
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state.clone());
+        .layer(axum::middleware::from_fn_with_state(state.clone(), security::headers))
+        .layer(TraceLayer::new_for_http());
+    app.with_state(state)
+}
+
+async fn serve(state: AppState, bind: SocketAddr) -> Result<()> {
+    if state.cfg.oidc.is_none() {
+        tracing::warn!("OIDC is not configured - nobody can log in to the admin UI");
+    }
+    let app = app_router(state.clone());
     backup::spawn_scheduler(state.clone());
     activity::info(&state.pool, "server", None, format!("pdfsign {} started", version())).await;
     let listener = tokio::net::TcpListener::bind(bind).await?;

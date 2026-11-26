@@ -1,5 +1,3 @@
-export const legacyCommands = new Set(['register', 'signup', 'equipment', 'documents', 'handout', 'docs', 'link-account']);
-
 const memberHelp = [
   '**pdfsign commands**',
   '`!help` - Show this menu.',
@@ -18,8 +16,18 @@ const staffHelp = [
   '`!link-account <old-user-id> @new-member` - Move records to a replacement account.',
 ];
 
-export function commandHelp(staff: boolean, intro?: string) {
-  const lines = intro ? [intro, '', ...memberHelp] : [...memberHelp];
-  if (staff) lines.push(...staffHelp);
+export function commandHelp(staff: boolean, signing: boolean, events: boolean, intro?: string) {
+  const commands = signing ? memberHelp : memberHelp.slice(0, 2);
+  const lines = intro ? [intro, '', ...commands] : [...commands];
+  if (staff && signing) lines.push(...staffHelp);
+  if (events) lines.push(
+    '',
+    '**Events · Authentik login**',
+    '!event list · Browse events.',
+    '!event create · Schedule an event.',
+    '!event show <id> · View and RSVP.',
+    '!event edit <id> · Update an event.',
+    '!event cancel <id> · Review and cancel an event.',
+  );
   return lines.join('\n');
 }

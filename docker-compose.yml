@@ -8,6 +8,11 @@ services:
     environment:
       BACKUP_DIR: /backups
       TZ: ${TZ:-UTC}
+      CALENDAR_URL: ${CALENDAR_URL:-http://calendar:3090}
+      CALENDAR_ADMIN_TOKEN: ""
+      CALENDAR_FEED_TOKEN: ""
+      CALENDAR_WEBHOOK_BEARER_TOKEN: ""
+      CALENDAR_WEBHOOK_SECRET: ""
     # run as the host user so data/ and export/ are plain files you own
     user: "${PDFSIGN_UID:-1000}:${PDFSIGN_GID:-1000}"
     volumes:
@@ -19,12 +24,29 @@ services:
       - "${PDFSIGN_BIND:-127.0.0.1:8080}:8080"
 
   bot:
+    profiles: [bot]
     build: ./bot
     image: ${PDFSIGN_BOT_IMAGE:-pdfsign-bot}:${PDFSIGN_TAG:-latest}
     restart: unless-stopped
     env_file: .env
     environment:
       PDFSIGN_URL: http://pdfsign:8080
+      CALENDAR_ADMIN_TOKEN: ""
+      CALENDAR_FEED_TOKEN: ""
+      CALENDAR_PDFSIGN_TOKEN: ""
+      CALENDAR_WEBHOOK_BEARER_TOKEN: ""
+      CALENDAR_WEBHOOK_SECRET: ""
     depends_on:
       pdfsign:
         condition: service_healthy
+
+  calendar:
+    profiles: [calendar]
+    extends:
+      file: calendar/docker-compose.yml
+      service: calendar
+    build: ./calendar
+
+volumes:
+  calendar-data:
+    name: ${CALENDAR_VOLUME_NAME:-calendar_calendar-data}

@@ -22,8 +22,11 @@ CREATE TABLE IF NOT EXISTS persons (
     email      TEXT,
     zip        TEXT,
     notes      TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    -- util::normalize_name(name), kept in step with `name` by every write
+    name_key   TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_persons_name_key ON persons(name_key);
 
 CREATE TABLE IF NOT EXISTS person_groups (
     id TEXT PRIMARY KEY,
@@ -71,7 +74,7 @@ CREATE TABLE IF NOT EXISTS submissions (
 CREATE INDEX IF NOT EXISTS idx_sub_person ON submissions(person_id, template_id);
 CREATE INDEX IF NOT EXISTS idx_sub_updated ON submissions(updated_at DESC, id DESC);
 
--- Match service::validity, including legacy completions with no timestamp.
+-- Match service::validity: a completion without a timestamp or validity never expires.
 CREATE VIEW IF NOT EXISTS document_status AS
 SELECT s.*, CASE WHEN s.status = 'completed'
     AND julianday(s.completed_at) + t.validity_days <= julianday('now')
@@ -98,12 +101,18 @@ CREATE TABLE IF NOT EXISTS rounds (
     user_agent    TEXT NOT NULL DEFAULT '',
     created_at    TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_rounds_submission ON rounds(submission_id, id);
 
 CREATE TABLE IF NOT EXISTS signer_sessions (
     token_hash    TEXT PRIMARY KEY,
     submission_id TEXT NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
-    expires_at    TEXT NOT NULL
+    expires_at    TEXT NOT NULL,
+    -- QR sessions: the page address used instead of the personal link token
+    handle        TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_signer_sessions_submission ON signer_sessions(submission_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_signer_sessions_handle ON signer_sessions(handle) WHERE handle IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_signer_sessions_expiry ON signer_sessions(expires_at);
 
 CREATE TABLE IF NOT EXISTS api_keys (
     id           TEXT PRIMARY KEY,
@@ -121,16 +130,20 @@ CREATE TABLE IF NOT EXISTS users (
     username      TEXT NOT NULL,
     name          TEXT NOT NULL DEFAULT '',
     email         TEXT,
-    role          TEXT NOT NULL,          -- admin | staff
+    role          TEXT NOT NULL,          -- admin | staff | attendee
     created_at    TEXT NOT NULL,
-    last_login_at TEXT NOT NULL
+    last_login_at TEXT NOT NULL,
+    sessions_revoked_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS user_sessions (
     token_hash TEXT PRIMARY KEY,
     user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    expires_at TEXT NOT NULL
+    expires_at TEXT NOT NULL,
+    issuer     TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_sessions_expiry ON user_sessions(expires_at);
 
 CREATE TABLE IF NOT EXISTS oidc_states (
     state      TEXT PRIMARY KEY,
@@ -153,6 +166,7 @@ CREATE TABLE IF NOT EXISTS public_links (
     created_by  TEXT,
     created_at  TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_public_links_template ON public_links(template_id, created_at);
 
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
@@ -168,3 +182,4 @@ CREATE TABLE IF NOT EXISTS activity_log (
     actor      TEXT,
     message    TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_activity_level_time ON activity_log(level, created_at);

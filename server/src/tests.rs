@@ -21,6 +21,14 @@ impl Drop for Env {
 }
 
 async fn env() -> Env {
+    env_with_events(false).await
+}
+
+async fn env_with_events(events_enabled: bool) -> Env {
+    env_with_calendar(events_enabled, None, None).await
+}
+
+async fn env_with_calendar(events_enabled: bool, url: Option<reqwest::Url>, token: Option<String>) -> Env {
     let root = std::env::temp_dir().join(format!("pdfsign-test-{}", random_token(12)));
     let cfg = Config {
         data_dir: root.join("data"),
@@ -31,9 +39,242 @@ async fn env() -> Env {
         web_dir: root.join("web"),
         max_name_attempts: 10,
         audit_page: true,
+        events_enabled,
+        calendar_url: url,
+        calendar_pdfsign_token: token,
         trusted_proxies: vec![],
     };
     Env { st: AppState::new(cfg).await.unwrap(), root }
+}
+
+async fn http_app(state: AppState) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = crate::app_router(state);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap()
+    });
+    (base, server)
+}
+
+async fn login_session(state: &AppState, role: &str) -> String {
+    sqlx::query("INSERT INTO users (id, sub, username, role, created_at, last_login_at) VALUES (?, ?, ?, ?, '', '')")
+        .bind(role).bind(role).bind(role).bind(role).execute(&state.pool).await.unwrap();
+    sqlx::query("INSERT INTO user_sessions (token_hash, user_id, expires_at) VALUES (?, ?, '9999-01-01')")
+        .bind(sha256_hex(role)).bind(role).execute(&state.pool).await.unwrap();
+    format!("pdfsign_session={role}")
+}
+
+#[tokio::test]
+async fn public_signing_survives_disabled_and_unavailable_events() {
+    for enabled in [false, true] {
+        let e = env_with_events(enabled).await;
+        let st = &e.st;
+        let (base, server) = http_app(st.clone()).await;
+        let client = reqwest::Client::new();
+        let health = client.get(format!("{base}/api/events/health")).send().await.unwrap();
+        assert_eq!(health.status().as_u16(), if enabled { 503 } else { 404 });
+        if enabled {
+            let staff = login_session(st, "staff").await;
+            let res = client.get(format!("{base}/api/admin/events")).header("cookie", staff).send().await.unwrap();
+            assert_eq!(res.status(), 503);
+        } else {
+            assert_eq!(client.get(format!("{base}/api/admin/events")).send().await.unwrap().status(), 404);
+        }
+        let t = template(st, 0).await;
+        let person = create_person(&st.pool, "Signer", None, None).await.unwrap();
+        let (sub, _) = find_or_create_submission(&st.pool, &t, &person, true, None).await.unwrap();
+        let url = format!("{base}/api/public/s/{}", sub.token);
+        let response: serde_json::Value = client.post(format!("{url}/unlock"))
+            .json(&serde_json::json!({"name": "Signer"})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let session = response["session"].as_str().unwrap();
+        let response: serde_json::Value = client.post(format!("{url}/submit")).header("x-session", session)
+            .json(&serde_json::json!({"values": {"name": "Signer"}})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(response["status"], "completed");
+        let pdf = client.get(format!("{url}/signed.pdf")).header("x-session", session)
+            .send().await.unwrap().error_for_status().unwrap().bytes().await.unwrap();
+        assert!(pdf.starts_with(b"%PDF-"));
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn signing_attempts_lock_atomically_and_qr_respects_the_lock() {
+    let e = env().await;
+    let t = template(&e.st, 1).await;
+    let person = create_person(&e.st.pool, "Test Signer", None, Some("12345")).await.unwrap();
+    let (sub, _) = find_or_create_submission(&e.st.pool, &t, &person, false, None).await.unwrap();
+    sqlx::query("INSERT INTO public_links (id, template_id, token, created_at) VALUES ('test-link', ?, 'test-qr-token', ?)")
+        .bind(&t.id).bind(now()).execute(&e.st.pool).await.unwrap();
+    let (base, server) = http_app(e.st.clone()).await;
+    let client = reqwest::Client::new();
+    let unlock = format!("{base}/api/public/s/{}/unlock", sub.token);
+    let answers = futures_join_all((0..16).map(|_| async {
+        client.post(&unlock).json(&serde_json::json!({"name": "Different name"})).send().await.unwrap().status().as_u16()
+    })).await;
+    assert_eq!(answers.iter().filter(|&&status| status == 403).count(), 10, "{answers:?}");
+    assert_eq!(answers.iter().filter(|&&status| status == 423).count(), 6, "{answers:?}");
+    assert_eq!(get_submission(&e.st.pool, &sub.id).await.unwrap().failed_attempts, 10);
+    assert_eq!(client.post(format!("{base}/api/public/p/test-qr-token/identify"))
+        .json(&serde_json::json!({"name": person.name, "zip": "12345"})).send().await.unwrap().status(), 423);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM signer_sessions").fetch_one(&e.st.pool).await.unwrap(), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn administrators_can_revoke_all_sessions_for_a_user() {
+    let e = env().await;
+    let admin = login_session(&e.st, "admin").await;
+    let staff = login_session(&e.st, "staff").await;
+    let (base, server) = http_app(e.st.clone()).await;
+    let client = reqwest::Client::new();
+    let sessions = format!("{base}/api/admin/users/staff/sessions");
+    assert_eq!(client.delete(&sessions).header("cookie", &staff).send().await.unwrap().status(), 403);
+    let response: serde_json::Value = client.delete(sessions).header("cookie", &admin)
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(response["revoked"], 1);
+    assert_eq!(client.get(format!("{base}/api/admin/me")).header("cookie", &staff).send().await.unwrap().status(), 401);
+    assert_eq!(client.get(format!("{base}/api/admin/me")).header("cookie", &admin).send().await.unwrap().status(), 200);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable calendar service; see calendar/README.md"]
+async fn event_access_and_calendar_share_the_calendar_database() {
+    use serde_json::{json, Value};
+
+    let calendar_origin = std::env::var("PDFSIGN_TEST_CALENDAR_URL").unwrap();
+    let calendar_token = std::env::var("PDFSIGN_TEST_CALENDAR_TOKEN").unwrap();
+    let calendar_admin_token = std::env::var("PDFSIGN_TEST_CALENDAR_ADMIN_TOKEN").unwrap();
+    let e = env_with_calendar(true, Some(calendar_origin.parse().unwrap()), Some(calendar_token)).await;
+    let staff = login_session(&e.st, "staff").await;
+    let admin = login_session(&e.st, "admin").await;
+    let attendee = login_session(&e.st, "attendee").await;
+    let (_, signing_key) = crate::auth::create_api_key(&e.st, "signing", None).await.unwrap();
+    let (base, server) = http_app(e.st.clone()).await;
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let staff_events = format!("{base}/api/admin/events");
+    let api_events = format!("{base}/api/events/v1/events");
+    let credentials = format!("{staff_events}/credentials");
+    assert_eq!(client.get(format!("{base}/api/events/health")).send().await.unwrap().status(), 204);
+    let res = client.get(format!("{base}/admin/events/new")).send().await.unwrap();
+    assert_eq!(res.status(), 303);
+    assert_eq!(res.headers()["location"], "/auth/login?next=%2Fadmin%2Fevents%2Fnew");
+    assert_eq!(client.get(&staff_events).send().await.unwrap().status(), 401);
+    assert_eq!(client.get(&api_events).bearer_auth(&signing_key).send().await.unwrap().status(), 401);
+    assert_eq!(client.get(&api_events).header("cookie", &staff).send().await.unwrap().status(), 401);
+    assert_eq!(client.get(format!("{base}/api/admin/templates")).header("cookie", &attendee).send().await.unwrap().status(), 403);
+    assert_eq!(client.get(&credentials).header("cookie", &staff).send().await.unwrap().status(), 403);
+
+    let issue = |name: &str, scope: &str| {
+        client.post(&credentials).header("cookie", &admin).json(&json!({"name": name, "scope": scope})).send()
+    };
+    let read: Value = issue("Calendar bridge", "read").await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let read = read["secret"].as_str().unwrap();
+    let write: Value = issue("Event creator", "write").await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let write = write["secret"].as_str().unwrap();
+    let calendar: Value = issue("Office calendar", "calendar").await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let calendar_path = reqwest::Url::parse(calendar["secret"].as_str().unwrap()).unwrap();
+    let calendar_url = format!("{base}{}", calendar_path.path());
+
+    let event = json!({
+        "title": "Club, meetup",
+        "description": format!("First line\nSecond; {}", "é".repeat(50)),
+        "location": "HQ",
+        "starts_at": "2090-04-22T18:00:00+02:00",
+        "ends_at": "2090-04-22T19:00:00+02:00"
+    });
+    assert_eq!(client.post(&staff_events).header("cookie", &attendee).json(&event).send().await.unwrap().status(), 403);
+    assert_eq!(client.post(&api_events).bearer_auth(read).json(&event).send().await.unwrap().status(), 403);
+    let create = |input: &Value| client.post(&api_events).bearer_auth(write).header("idempotency-key", "club-meetup").json(input).send();
+    let created = create(&event).await.unwrap();
+    assert_eq!(created.status(), 201);
+    let created: Value = created.json().await.unwrap();
+    let duplicate = create(&event).await.unwrap();
+    assert_eq!(duplicate.status(), 200);
+    assert_eq!(duplicate.json::<Value>().await.unwrap()["id"], created["id"]);
+    let mut changed = event.clone();
+    changed["title"] = json!("Other title");
+    assert_eq!(create(&changed).await.unwrap().status(), 409);
+    assert_eq!(created["starts_at"], "2090-04-22T16:00:00Z");
+    assert_eq!(created["phase"], "upcoming");
+    let id = created["id"].as_str().unwrap();
+    let standalone = format!("{calendar_origin}/api/v1/events");
+    let direct: Value = client.get(format!("{standalone}/{id}")).bearer_auth(&calendar_admin_token)
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(direct["title"], event["title"]);
+    let all_day: Value = client.post(&standalone).bearer_auth(&calendar_admin_token).json(&json!({
+        "title": "Calendar UI event", "all_day": true, "starts_at": "2090-05-01", "ends_at": "2090-05-02"
+    })).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let all_day_id = all_day["id"].as_str().unwrap();
+    let detail: Value = client.get(format!("{staff_events}/{all_day_id}")).header("cookie", &staff)
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(detail["all_day"], true);
+    assert_eq!(detail["starts_at"], "2090-05-01");
+    let updated = client.patch(format!("{standalone}/{id}")).bearer_auth(&calendar_admin_token)
+        .header("if-match", "\"0\"").json(&json!({"location": "New HQ"}))
+        .send().await.unwrap();
+    assert_eq!(updated.status(), 200);
+    let rsvp_url = format!("{staff_events}/{id}/rsvp");
+    let respond = |response: &str| client.put(&rsvp_url).header("cookie", &attendee).json(&json!({"response": response})).send();
+    assert_eq!(respond("maybe").await.unwrap().status(), 200);
+    let going: Value = respond("going").await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(going["my_rsvp"], "going");
+    let view: Value = client.get(format!("{api_events}/{id}")).bearer_auth(read).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(view["going"], 1);
+    assert_eq!(view["maybe"], 0);
+    assert!(view.get("my_rsvp").is_none());
+    assert_eq!(client.get(&staff_events).bearer_auth(read).send().await.unwrap().status(), 401);
+
+    let mut cancelled = event.clone();
+    cancelled["revision"] = json!(1);
+    cancelled["status"] = json!("cancelled");
+    let update = || client.put(format!("{api_events}/{id}")).bearer_auth(write).json(&cancelled).send();
+    assert_eq!(update().await.unwrap().status(), 200);
+    assert_eq!(update().await.unwrap().status(), 409);
+    assert_eq!(respond("declined").await.unwrap().status(), 409);
+    let direct: Value = client.get(format!("{standalone}/{id}")).bearer_auth(&calendar_admin_token)
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(direct["status"], "cancelled");
+    assert_eq!(direct["revision"], 2);
+
+    let feed = client.get(&calendar_url).send().await.unwrap().error_for_status().unwrap();
+    assert_eq!(feed.headers()["content-type"], "text/calendar; charset=utf-8");
+    assert_eq!(feed.headers()["cache-control"], "no-store");
+    let feed = feed.text().await.unwrap();
+    assert!(feed.contains("SUMMARY:Club\\, meetup\r\n"));
+    assert!(feed.contains("DESCRIPTION:First line\\nSecond\\; "));
+    assert!(feed.contains("SEQUENCE:2\r\n"));
+    assert!(feed.contains("STATUS:CANCELLED\r\n"));
+    assert!(feed.contains("DTSTART;VALUE=DATE:20900501\r\n"));
+    assert!(feed.split("\r\n").all(|line| line.len() <= 75));
+    let revoked = client.delete(format!("{credentials}/{}", calendar["id"].as_str().unwrap()))
+        .header("cookie", &admin).send().await.unwrap();
+    assert_eq!(revoked.status(), 204);
+    assert_eq!(client.get(calendar_url).send().await.unwrap().status(), 404);
+    assert_eq!(client.delete(format!("{standalone}/{all_day_id}")).bearer_auth(&calendar_admin_token)
+        .send().await.unwrap().status(), 204);
+    assert_eq!(client.get(format!("{staff_events}/{all_day_id}")).header("cookie", &staff)
+        .send().await.unwrap().status(), 404);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_schema WHERE name IN ('events', 'event_rsvps', 'event_credentials')")
+        .fetch_one(&e.st.pool).await.unwrap(), 0);
+
+    let snapshot = format!("{calendar_origin}/internal/pdfsign/backup");
+    assert_eq!(client.get(snapshot).bearer_auth(&calendar_admin_token).send().await.unwrap().status(), 404);
+    let backup = crate::backup::run_backup(&e.st, "calendar integration test").await.unwrap();
+    assert_eq!(backup.last_ok, Some(true), "{:?}", backup.last_error);
+    let archive = e.st.cfg.backup_dir.join(backup.last_file.unwrap());
+    let signing_dir = e.root.join("restored-signing");
+    let calendar_dir = e.root.join("restored-calendar");
+    assert!(crate::backup::restore(&archive, &signing_dir, None, false, false).await.is_err());
+    let restore = crate::backup::restore(&archive, &signing_dir, Some(&calendar_dir), false, false).await.unwrap();
+    assert!(restore.calendar_restored);
+    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", calendar_dir.join("calendar.sqlite").display())).await.unwrap();
+    assert_eq!(sqlx::query_scalar::<_, String>("SELECT status FROM events WHERE id = ?").bind(id).fetch_one(&db).await.unwrap(), "cancelled");
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM event_rsvps WHERE event_id = ?").bind(id).fetch_one(&db).await.unwrap(), 1);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM event_credentials").fetch_one(&db).await.unwrap(), 0);
+    db.close().await;
+    server.abort();
 }
 
 fn text_field(id: &str, section: u32, y: f64) -> Field {
@@ -61,7 +302,7 @@ async fn admin_deletion_scopes_and_permissions() {
     for role in ["staff", "admin"] {
         sqlx::query("INSERT INTO users (id, sub, username, role, created_at, last_login_at) VALUES (?, ?, ?, ?, '', '')")
             .bind(role).bind(role).bind(role).bind(role).execute(&st.pool).await.unwrap();
-        sqlx::query("INSERT INTO user_sessions VALUES (?, ?, '9999-01-01')").bind(sha256_hex(role)).bind(role).execute(&st.pool).await.unwrap();
+        sqlx::query("INSERT INTO user_sessions (token_hash, user_id, expires_at) VALUES (?, ?, '9999-01-01')").bind(sha256_hex(role)).bind(role).execute(&st.pool).await.unwrap();
     }
     sqlx::query("INSERT INTO public_links (id, template_id, token, created_at) VALUES ('qr', ?, 'link', '')")
         .bind(&t.id).execute(&st.pool).await.unwrap();
@@ -136,7 +377,7 @@ async fn people_pages_and_group_requirements_use_person_identity() {
     sqlx::query("UPDATE templates SET validity_days = 30 WHERE id = ?").bind(&t.id).execute(&st.pool).await.unwrap();
     // Identical names and update times exercise both pagination tie-breakers.
     sqlx::raw_sql("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<106)
-        INSERT INTO persons (id, name, created_at) SELECT printf('p%03d',i), 'Alex Lee', '' FROM n;")
+        INSERT INTO persons (id, name, name_key, created_at) SELECT printf('p%03d',i), 'Alex Lee', 'alex lee', '' FROM n;")
         .execute(&st.pool).await.unwrap();
     sqlx::query("INSERT INTO submissions (id, token, template_id, person_id, status, created_at, updated_at)
         SELECT id, id, ?, id, 'pending', '', '' FROM persons WHERE id != 'p001'")
@@ -147,7 +388,7 @@ async fn people_pages_and_group_requirements_use_person_identity() {
         UPDATE submissions SET status = 'revoked' WHERE id = 'p004';
         INSERT INTO users (id, sub, username, role, created_at, last_login_at) VALUES ('tester','tester','tester','staff','','');")
         .execute(&st.pool).await.unwrap();
-    sqlx::query("INSERT INTO user_sessions VALUES (?, 'tester', '9999-01-01')").bind(sha256_hex("test-session")).execute(&st.pool).await.unwrap();
+    sqlx::query("INSERT INTO user_sessions (token_hash, user_id, expires_at) VALUES (?, 'tester', '9999-01-01')").bind(sha256_hex("test-session")).execute(&st.pool).await.unwrap();
     let app = crate::routes::admin::router().with_state(st.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -210,7 +451,7 @@ async fn session(st: &AppState, sub: &Submission) -> String {
 
 async fn sign(st: &AppState, sub: &Submission, t: &Template, p: &Person, hash: &str, values: &[(&str, &str)]) -> AppResult<Submission> {
     let input: HashMap<String, String> = values.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-    submit_round(&st.pool, sub, t, p, &input, SubmitContext { signer_name: &p.name, ip: "", user_agent: "test", session_hash: Some(hash) }).await
+    submit_round(st, sub, t, p, &input, SubmitContext { signer_name: &p.name, ip: "", user_agent: "test", session_hash: Some(hash) }).await
 }
 
 #[tokio::test]
@@ -352,22 +593,38 @@ async fn restore_is_validated_and_keeps_current_data_on_failure() {
     let (sub, _) = find_or_create_submission(&st.pool, &t, &p, false, None).await.unwrap();
     let h = session(st, &sub).await;
     sign(st, &sub, &t, &p, &h, &[("name", "Finn")]).await.unwrap();
+    login_session(st, "admin").await;
+    crate::auth::create_api_key(st, "backup test", None).await.unwrap();
+    sqlx::query("INSERT INTO public_links (id, template_id, token, created_at) VALUES ('qr', ?, 'old-qr', ?)")
+        .bind(&t.id).bind(now()).execute(&st.pool).await.unwrap();
 
     let status = crate::backup::run_backup(st, "test").await.unwrap();
     assert_eq!(status.last_ok, Some(true), "{:?}", status.last_error);
     let archive = st.cfg.backup_dir.join(status.last_file.unwrap());
 
-    // restore into a fresh directory: template PDF and the signer session come back
+    // Restoring keeps the signed record and templates and retires access granted before the restore.
     let fresh = e.root.join("fresh");
-    assert_eq!(crate::backup::restore(&archive, &fresh, false).await.unwrap(), None);
+    assert!(crate::backup::restore(&archive, &fresh, None, false, false).await.unwrap().signing_previous.is_none());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&archive).unwrap().permissions().mode() & 0o077, 0);
+    }
     assert!(fresh.join("templates").join(format!("{}.pdf", t.id)).is_file());
     let restored = sqlx::SqlitePool::connect(&format!("sqlite://{}", fresh.join("pdfsign.db").display())).await.unwrap();
-    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM signer_sessions WHERE token_hash = ?").bind(&h).fetch_one(&restored).await.unwrap();
-    assert_eq!(n, 1);
+    for query in ["SELECT count(*) FROM signer_sessions", "SELECT count(*) FROM user_sessions", "SELECT count(*) FROM api_keys"] {
+        assert_eq!(sqlx::query_scalar::<_, i64>(query).fetch_one(&restored).await.unwrap(), 0);
+    }
+    let restored_sub: Submission = get_submission(&restored, &sub.id).await.unwrap();
+    assert_eq!(restored_sub.status, "completed");
+    assert_ne!(restored_sub.token, sub.token);
+    let qr: (String, bool) = sqlx::query_as("SELECT token, active FROM public_links WHERE id = 'qr'").fetch_one(&restored).await.unwrap();
+    assert_ne!(qr.0, "old-qr");
+    assert!(!qr.1);
     restored.close().await;
 
     // restoring over existing data moves it aside
-    let previous = crate::backup::restore(&archive, &fresh, true).await.unwrap().expect("previous data kept");
+    let previous = crate::backup::restore(&archive, &fresh, None, false, true).await.unwrap().signing_previous.expect("previous data kept");
     assert!(previous.join("pdfsign.db").is_file());
 
     // a broken archive (garbage database, missing PDF) leaves the current data untouched
@@ -379,7 +636,7 @@ async fn restore_is_validated_and_keeps_current_data_on_failure() {
         std::io::Write::write_all(&mut zw, b"not a database").unwrap();
         zw.finish().unwrap();
     }
-    assert!(crate::backup::restore(&bad, &fresh, true).await.is_err());
+    assert!(crate::backup::restore(&bad, &fresh, None, false, true).await.is_err());
     let no_pdf = e.root.join("no-pdf.zip");
     {
         let mut src = zip::ZipArchive::new(std::fs::File::open(&archive).unwrap()).unwrap();
@@ -388,10 +645,28 @@ async fn restore_is_validated_and_keeps_current_data_on_failure() {
         std::io::Read::read_to_end(&mut src.by_name("pdfsign.db").unwrap(), &mut db).unwrap();
         zw.start_file("pdfsign.db", zip::write::SimpleFileOptions::default()).unwrap();
         std::io::Write::write_all(&mut zw, &db).unwrap();
+        zw.raw_copy_file(src.by_name("manifest.json").unwrap()).unwrap();
         zw.finish().unwrap();
     }
-    let err = crate::backup::restore(&no_pdf, &fresh, true).await.unwrap_err();
+    let err = crate::backup::restore(&no_pdf, &fresh, None, false, true).await.err().unwrap();
     assert!(format!("{err:#}").contains("template PDF"), "{err:#}");
+    // archives from earlier versions (format 1 or no manifest) are refused
+    let old = e.root.join("old.zip");
+    {
+        let mut src = zip::ZipArchive::new(std::fs::File::open(&archive).unwrap()).unwrap();
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&old).unwrap());
+        for i in 0..src.len() {
+            let entry = src.by_index(i).unwrap();
+            if entry.name().unwrap() != "manifest.json" {
+                zw.raw_copy_file(entry).unwrap();
+            }
+        }
+        zw.start_file("manifest.json", zip::write::SimpleFileOptions::default()).unwrap();
+        std::io::Write::write_all(&mut zw, br#"{"app": "pdfsign", "format": 1}"#).unwrap();
+        zw.finish().unwrap();
+    }
+    let err = crate::backup::restore(&old, &fresh, None, false, true).await.err().unwrap();
+    assert!(format!("{err:#}").contains("earlier pdfsign version"), "{err:#}");
     assert_eq!(std::fs::read(fresh.join("pdfsign.db")).unwrap(), before);
     assert!(fresh.join("templates").join(format!("{}.pdf", t.id)).is_file());
     assert!(!std::fs::read_dir(&fresh).unwrap().any(|d| d.unwrap().file_name().to_string_lossy().starts_with(".restore-")));
@@ -529,9 +804,12 @@ async fn export_jobs_report_progress_and_hand_out_the_zip_once() {
     assert_eq!(done.phase, "finished");
     assert!(done.ready);
     assert_eq!(done.report.as_ref().unwrap().written, 2);
-    let (name, bytes) = export_job::take_zip(st, &zip.id).unwrap();
+    let (name, archive) = export_job::take_zip(st, &zip.id).unwrap();
     assert!(name.starts_with(&format!("signatures-{}-", t.slug)));
-    assert!(zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap().len() >= 3);
+    assert!(zip::ZipArchive::new(std::fs::File::open(&archive.0).unwrap()).unwrap().len() >= 3);
+    let path = archive.0.clone();
+    drop((archive, done));
+    assert!(!path.exists(), "the archive is deleted with its last handle");
     assert!(export_job::take_zip(st, &zip.id).is_err(), "a ZIP is handed out once");
     assert!(!export_job::get(st, &zip.id).unwrap().ready);
 
@@ -544,4 +822,136 @@ async fn export_jobs_report_progress_and_hand_out_the_zip_once() {
     assert!(export_job::start(st, StartRequest { kind: Kind::Zip, dir: None, template: Some("missing".into()) }, "tester").await.is_err());
     let (logged,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM activity_log WHERE category = 'export'").fetch_one(&st.pool).await.unwrap();
     assert_eq!(logged, 2);
+}
+
+#[tokio::test]
+async fn general_links_need_the_zip_and_never_reveal_the_personal_token() {
+    let e = env().await;
+    let st = &e.st;
+    let t = template(st, 0).await;
+    let alice = create_person(&st.pool, "Alice Example", None, Some("12345")).await.unwrap();
+    // a pending personal link, as the bot would DM it
+    let (personal, _) = find_or_create_submission(&st.pool, &t, &alice, false, None).await.unwrap();
+    create_person(&st.pool, "Bob Nozip", None, None).await.unwrap();
+    sqlx::query("INSERT INTO public_links (id, template_id, token, created_at) VALUES ('qr', ?, 'qr-link', ?)")
+        .bind(&t.id).bind(now()).execute(&st.pool).await.unwrap();
+    let (base, server) = http_app(st.clone()).await;
+    let client = reqwest::Client::new();
+    let identify = |body: serde_json::Value| client.post(format!("{base}/api/public/p/qr-link/identify")).json(&body).send();
+
+    // without a ZIP code, registered and unknown names get the same answer
+    for name in ["Alice Example", "Nobody Known"] {
+        let r: serde_json::Value = identify(serde_json::json!({"name": name})).await.unwrap().json().await.unwrap();
+        assert_eq!(r, serde_json::json!({"result": "need_zip", "reason": "verify"}));
+    }
+    // the right name with a wrong ZIP code does not reach Alice's document
+    let r: serde_json::Value = identify(serde_json::json!({"name": "Alice Example", "zip": "99999"})).await.unwrap().json().await.unwrap();
+    assert_eq!(r["result"], "sign");
+    let reached: String = sqlx::query_scalar("SELECT submission_id FROM signer_sessions WHERE handle = ?")
+        .bind(r["handle"].as_str().unwrap()).fetch_one(&st.pool).await.unwrap();
+    assert_ne!(reached, personal.id);
+    // a namesake without a ZIP code on file cannot be confirmed
+    assert_eq!(identify(serde_json::json!({"name": "Bob Nozip", "zip": "12345"})).await.unwrap().status(), 409);
+
+    // name + ZIP: a session on a handle, never the personal token
+    let r: serde_json::Value = identify(serde_json::json!({"name": "alice  example", "zip": "12 345"})).await.unwrap().json().await.unwrap();
+    assert_eq!(r["result"], "sign");
+    assert!(r.get("token").is_none());
+    let handle = r["handle"].as_str().unwrap();
+    assert!(handle.starts_with("qr-") && !r.to_string().contains(&personal.token));
+    let session = r["session"].as_str().unwrap();
+    let page = format!("{base}/api/public/s/{handle}");
+    assert_eq!(client.get(&page).send().await.unwrap().status(), 200);
+    // the handle is not a link: it cannot be unlocked by name
+    assert_eq!(client.post(format!("{page}/unlock")).json(&serde_json::json!({"name": "Alice Example"})).send().await.unwrap().status(), 410);
+    let form: serde_json::Value = client.post(format!("{page}/submit")).header("x-session", session)
+        .json(&serde_json::json!({"values": {"name": "Alice Example"}})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(form["status"], "completed");
+    assert_eq!(get_submission(&st.pool, &personal.id).await.unwrap().status, "completed", "the open document was used");
+    // once the session ends, so does the handle
+    sqlx::query("UPDATE signer_sessions SET expires_at = '2000-01-01'").execute(&st.pool).await.unwrap();
+    assert_eq!(client.get(&page).send().await.unwrap().status(), 410);
+    server.abort();
+}
+
+#[tokio::test]
+async fn discord_registration_cannot_rename_a_person() {
+    let e = env().await;
+    let p = upsert_discord_person(&e.st.pool, "123456789", Some("Carla Example"), Some("carla"), Some("11111")).await.unwrap();
+    assert_eq!(p.zip.as_deref(), Some("11111"));
+    // the same name in another spelling is fine, the ZIP code on file stays
+    let same = upsert_discord_person(&e.st.pool, "123456789", Some("carla  EXAMPLE"), None, Some("22222")).await.unwrap();
+    assert_eq!((same.name.as_str(), same.zip.as_deref()), ("Carla Example", Some("11111")));
+    let err = upsert_discord_person(&e.st.pool, "123456789", Some("Someone Else"), None, None).await.unwrap_err();
+    assert_eq!(err.code, "already_registered");
+    assert_eq!(get_person(&e.st.pool, &p.id).await.unwrap().name, "Carla Example");
+    // a person renamed by staff (name and key together) is found under the new name only
+    sqlx::query("UPDATE persons SET name = 'Carla Renamed', name_key = ? WHERE id = ?")
+        .bind(crate::util::normalize_name("Carla Renamed")).bind(&p.id).execute(&e.st.pool).await.unwrap();
+    assert_eq!(persons_by_name(&e.st.pool, "Carla Renamed").await.unwrap().len(), 1);
+    assert!(persons_by_name(&e.st.pool, "Carla Example").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn browsers_get_hardened_responses_and_cross_site_writes_are_refused() {
+    let e = env().await;
+    let st = &e.st;
+    std::fs::create_dir_all(&st.cfg.web_dir).unwrap();
+    std::fs::write(st.cfg.web_dir.join("index.html"), "<!doctype html>").unwrap();
+    let staff = login_session(st, "staff").await;
+    let (base, server) = http_app(st.clone()).await;
+    let client = reqwest::Client::new();
+    let page = client.get(format!("{base}/s/whatever")).send().await.unwrap();
+    assert!(page.headers()["content-security-policy"].to_str().unwrap().contains("frame-ancestors"));
+    assert_eq!(page.headers()["referrer-policy"], "no-referrer");
+    assert_eq!(page.headers()["x-content-type-options"], "nosniff");
+
+    let group = |site: Option<&str>, origin: Option<&str>| {
+        let mut r = client.post(format!("{base}/api/admin/groups")).header("cookie", &staff).json(&serde_json::json!({"name": random_token(8)}));
+        if let Some(site) = site { r = r.header("sec-fetch-site", site); }
+        if let Some(origin) = origin { r = r.header("origin", origin); }
+        r.send()
+    };
+    assert_eq!(group(Some("same-site"), None).await.unwrap().status(), 403);
+    assert_eq!(group(None, Some("https://calendar.example.com")).await.unwrap().status(), 403);
+    assert_eq!(group(Some("same-origin"), None).await.unwrap().status(), 200);
+    assert_eq!(group(None, Some("http://localhost")).await.unwrap().status(), 200);
+    assert_eq!(group(None, None).await.unwrap().status(), 200);
+    server.abort();
+}
+
+#[tokio::test]
+async fn internal_errors_are_not_shown_to_clients() {
+    use axum::response::IntoResponse;
+    let res = AppError::from(anyhow::anyhow!("/data/secret/path: permission denied")).into_response();
+    assert_eq!(res.status(), 500);
+    let detail = res.extensions().get::<crate::activity::FailedRequest>().map(|f| f.0.clone()).unwrap();
+    assert!(detail.contains("/data/secret/path"), "the activity log keeps the detail");
+    let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("secret"));
+}
+
+#[tokio::test]
+async fn output_folders_cannot_be_published_or_live_data() {
+    let e = env().await;
+    let st = &e.st;
+    for bad in [st.cfg.web_dir.join("exports"), st.cfg.data_dir.clone(), st.cfg.data_dir.join("templates"), PathBuf::from("relative")] {
+        assert!(check_output_dir(st, &bad).is_err(), "{}", bad.display());
+    }
+    assert!(check_output_dir(st, &st.cfg.export_dir).is_ok());
+    assert!(check_output_dir(st, &st.cfg.data_dir.join("backups")).is_ok());
+    // the defaults for a relative DATA_DIR (`./data/export`, `./data/backups`) are usable
+    for relative in ["./data/export", "./data/backups"] {
+        let dir = crate::output_dir(PathBuf::from(relative)).unwrap();
+        assert!(dir.is_absolute(), "{}", dir.display());
+        assert!(check_output_dir(st, &dir).is_ok(), "{}", dir.display());
+    }
+}
+
+#[test]
+fn ipv6_clients_share_a_rate_limit_per_64() {
+    use crate::state::rate_key;
+    assert_eq!(rate_key("2001:db8:1:2:aaaa::1"), rate_key("2001:db8:1:2:bbbb::2"));
+    assert_ne!(rate_key("2001:db8:1:2::1"), rate_key("2001:db8:1:3::1"));
+    assert_eq!(rate_key("192.0.2.1"), "192.0.2.1");
 }

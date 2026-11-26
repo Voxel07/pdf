@@ -1,0 +1,21 @@
+services:
+  calendar:
+    build: .
+    restart: unless-stopped
+    environment:
+      CALENDAR_ADMIN_TOKEN: ${CALENDAR_ADMIN_TOKEN:-}
+      CALENDAR_FEED_TOKEN: ${CALENDAR_FEED_TOKEN:-}
+      CALENDAR_PDFSIGN_TOKEN: ${CALENDAR_PDFSIGN_TOKEN:-}
+      CALENDAR_NAME: ${CALENDAR_NAME:-Calendar}
+      CALENDAR_PUBLIC_URL: ${CALENDAR_PUBLIC_URL:-}
+      CALENDAR_WEBHOOK_URL: ${CALENDAR_WEBHOOK_URL:-}
+      CALENDAR_WEBHOOK_BEARER_TOKEN: ${CALENDAR_WEBHOOK_BEARER_TOKEN:-}
+      CALENDAR_WEBHOOK_SECRET: ${CALENDAR_WEBHOOK_SECRET:-}
+    ports:
+      - "${CALENDAR_BIND:-127.0.0.1}:${CALENDAR_HOST_PORT:-3090}:3090"
+    volumes:
+      - calendar-data:/data
+
+volumes:
+  calendar-data:
+    name: ${CALENDAR_VOLUME_NAME:-calendar_calendar-data}

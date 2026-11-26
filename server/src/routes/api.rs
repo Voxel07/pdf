@@ -37,16 +37,26 @@ async fn templates(_c: ApiClient, State(st): State<AppState>) -> AppResult<Json<
 }
 
 async fn person_view(st: &AppState, p: &Person) -> AppResult<Value> {
-    let accounts = discord_accounts(&st.pool, &p.id).await?;
-    let subs: Vec<Submission> = sqlx::query_as("SELECT * FROM submissions WHERE person_id = ? ORDER BY created_at DESC")
-        .bind(&p.id)
-        .fetch_all(&st.pool)
-        .await?;
-    let mut docs = Vec::new();
-    for s in &subs {
-        let t = get_template(&st.pool, &s.template_id).await?;
-        docs.push(submission_json(st, s, &t).await?);
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        #[sqlx(flatten)]
+        submission: Submission,
+        template_name: String,
+        slug: String,
+        validity_days: Option<i64>,
     }
+    let accounts = discord_accounts(&st.pool, &p.id).await?;
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT s.*, t.name AS template_name, t.slug, t.validity_days FROM submissions s JOIN templates t ON t.id = s.template_id
+         WHERE s.person_id = ? ORDER BY s.created_at DESC",
+    )
+    .bind(&p.id)
+    .fetch_all(&st.pool)
+    .await?;
+    let docs: Vec<Value> = rows
+        .iter()
+        .map(|r| submission_summary(st, &r.submission, &p.name, &r.template_name, &r.slug, r.validity_days))
+        .collect();
     Ok(json!({ "person": p, "discord_accounts": accounts, "submissions": docs }))
 }
 

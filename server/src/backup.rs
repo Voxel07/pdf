@@ -4,11 +4,12 @@
 //! `AppState::gate`; the backup takes the write guard, which waits for in-flight requests to
 //! finish and holds new ones until the snapshot is taken (they are delayed, not rejected).
 //! While paused, the WAL is checkpointed and `VACUUM INTO` writes a consistent copy of the
-//! database. That copy includes all user and signer sessions, so nobody is logged out after a
-//! restore. The template PDFs are copied too. Then the app resumes, and the snapshot is
-//! zipped into `<dir>/backup-YYYYMMDD-HHMMSS.zip`.
+//! database; the template PDFs it references are copied after the pause (they never change
+//! once written). Event deployments also snapshot the separate
+//! calendar database. Staging directories and published archives are private to the owner.
 
-use std::io::Write;
+use std::fs::{DirBuilder, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -19,9 +20,54 @@ use axum::middleware::Next;
 use axum::response::Response;
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::{ConnectOptions, Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 
 use crate::state::AppState;
 use crate::util::*;
+
+pub const CALENDAR_MAX_BYTES: usize = 128 * 1024 * 1024;
+/// Archive layout written to `manifest.json`; restores accept only this format.
+const BACKUP_FORMAT: u64 = 2;
+const CALENDAR_DB: &str = "calendar.sqlite";
+
+struct PrivateDir(PathBuf);
+
+impl PrivateDir {
+    fn create(parent: &Path, purpose: &str) -> anyhow::Result<Self> {
+        let path = parent.join(format!(".{purpose}-{}", new_id()));
+        let mut builder = DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path).with_context(|| format!("creating {}", path.display()))?;
+        Ok(Self(path))
+    }
+
+    fn keep(mut self) -> PathBuf {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty() && let Err(error) = std::fs::remove_dir_all(&self.0) {
+            tracing::warn!("could not clean up backup staging {}: {error}", self.0.display());
+        }
+    }
+}
+
+fn private_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupConfig {
@@ -88,7 +134,7 @@ pub async fn load_status(state: &AppState) -> AppResult<BackupStatus> {
 }
 
 fn validate(cfg: &BackupConfig) -> AppResult<NaiveTime> {
-    if !cfg.dir.starts_with('/') {
+    if !Path::new(&cfg.dir).is_absolute() {
         return Err(AppError::bad_request("the backup folder must be an absolute path"));
     }
     if cfg.interval_hours == 0 || cfg.interval_hours > 24 * 31 {
@@ -147,6 +193,7 @@ pub fn reschedule(start: NaiveTime, interval_hours: u32, prev: Option<DateTime<U
 
 pub async fn save_config(state: &AppState, cfg: BackupConfig) -> AppResult<(BackupConfig, BackupStatus)> {
     let start = validate(&cfg)?;
+    crate::service::check_output_dir(state, Path::new(&cfg.dir))?;
     ensure_writable(Path::new(&cfg.dir)).map_err(|e| AppError::bad_request(format!("{e:#}")))?;
     let old = load_config(state).await?;
     set_setting(state, "backup_config", &cfg).await?;
@@ -161,9 +208,7 @@ pub async fn save_config(state: &AppState, cfg: BackupConfig) -> AppResult<(Back
 
 fn ensure_writable(dir: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let probe = dir.join(".pdfsign-write-test");
-    std::fs::write(&probe, b"ok").with_context(|| format!("{} is not writable", dir.display()))?;
-    let _ = std::fs::remove_file(probe);
+    let _probe = PrivateDir::create(dir, "pdfsign-write-test")?;
     Ok(())
 }
 
@@ -174,9 +219,9 @@ pub async fn write_gate(State(state): State<AppState>, req: Request, next: Next)
         let _guard = state.gate.write().await;
         return next.run(req).await;
     }
-    // Auth callbacks and ZIP exports also write records. Manual backups take their own guard.
+    // Auth callbacks can write records. Manual backups take their own guard.
     let read_only = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS)
-        && !path.starts_with("/auth/") && path != "/api/admin/export.zip";
+        && !path.starts_with("/auth/");
     if read_only || path == "/api/admin/backup/run" {
         return next.run(req).await;
     }
@@ -225,9 +270,17 @@ pub async fn run_backup(state: &AppState, trigger: &str) -> AppResult<BackupStat
 async fn do_backup(state: &AppState, cfg: &BackupConfig) -> anyhow::Result<(String, u64, u64)> {
     let dir = PathBuf::from(&cfg.dir);
     ensure_writable(&dir)?;
-    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let staging = dir.join(format!(".staging-{stamp}"));
-    std::fs::create_dir_all(staging.join("templates"))?;
+    let stamp = Local::now().format("%Y%m%d-%H%M%S-%3f");
+    let name = format!("backup-{stamp}-{}.zip", random_token(8));
+    let staging = PrivateDir::create(&dir, "staging")?;
+    let snapshot_dir = &staging.0;
+    std::fs::create_dir(snapshot_dir.join("templates"))?;
+    if state.cfg.events_enabled {
+        let bytes = crate::events::backup_snapshot(state).await?;
+        let mut file = private_file(&snapshot_dir.join(CALENDAR_DB))?;
+        file.write_all(&bytes)?;
+        validate_calendar_snapshot(&snapshot_dir.join(CALENDAR_DB)).await?;
+    }
 
     // ---- pause: wait for running writes, hold new ones
     let pause_start = Instant::now();
@@ -236,50 +289,41 @@ async fn do_backup(state: &AppState, cfg: &BackupConfig) -> anyhow::Result<(Stri
         .context("the app stayed busy for 2 minutes - backup skipped")?;
     let snapshot: anyhow::Result<()> = async {
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&state.pool).await?;
-        let db_path = staging.join("pdfsign.db");
+        let db_path = snapshot_dir.join("pdfsign.db");
         sqlx::query("VACUUM INTO ?").bind(db_path.display().to_string()).execute(&state.pool).await.context("VACUUM INTO")?;
-        let tdir = state.cfg.data_dir.join("templates");
-        if tdir.exists() {
-            for e in std::fs::read_dir(&tdir)? {
-                let p = e?.path();
-                if p.extension().is_some_and(|x| x == "pdf") {
-                    std::fs::copy(&p, staging.join("templates").join(p.file_name().unwrap()))?;
-                }
-            }
-        }
         Ok(())
     }
     .await;
     drop(guard);
     let pause_ms = pause_start.elapsed().as_millis() as u64;
     // ---- resumed
+    snapshot?;
+    // Template PDFs are never rewritten (a new upload gets a new id), so the ones the
+    // snapshot references are copied after the pause instead of during it.
+    copy_template_pdfs(state, snapshot_dir).await?;
     // a CLI backup does not share the running server's gate, so check the copy is complete
-    let snapshot = match snapshot {
-        Ok(()) => validate_snapshot(&staging).await.context("snapshot check"),
-        Err(e) => Err(e),
-    };
-    if let Err(e) = snapshot {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(e);
-    }
-
-    let name = format!("backup-{stamp}.zip");
+    validate_snapshot(snapshot_dir).await.context("snapshot check")?;
+    clear_signing_sessions(snapshot_dir).await?;
     let final_path = dir.join(&name);
-    let staging2 = staging.clone();
-    let tmp_path = dir.join(format!(".{name}.tmp"));
+    let calendar = state.cfg.events_enabled;
+    let tmp_path = snapshot_dir.join(&name);
+    let staging2 = snapshot_dir.clone();
     let tmp2 = tmp_path.clone();
     let size = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-        let f = std::fs::File::create(&tmp2)?;
+        let f = private_file(&tmp2)?;
         let mut zw = zip::ZipWriter::new(f);
         let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(true);
         let manifest = serde_json::json!({
-            "app": "pdfsign", "format": 1, "created_at": now(),
-            "restore": "pdfsign restore <this file> --force (with the server stopped)",
+            "app": "pdfsign", "format": BACKUP_FORMAT, "created_at": now(), "calendar": calendar,
         });
         zw.start_file("manifest.json", opts)?;
         zw.write_all(serde_json::to_vec_pretty(&manifest)?.as_slice())?;
         zw.start_file("pdfsign.db", opts)?;
         std::io::copy(&mut std::fs::File::open(staging2.join("pdfsign.db"))?, &mut zw)?;
+        if calendar {
+            zw.start_file(CALENDAR_DB, opts)?;
+            std::io::copy(&mut File::open(staging2.join(CALENDAR_DB))?, &mut zw)?;
+        }
         let mut templates: Vec<_> = std::fs::read_dir(staging2.join("templates"))?.filter_map(|e| e.ok().map(|e| e.path())).collect();
         templates.sort();
         for p in templates {
@@ -292,13 +336,28 @@ async fn do_backup(state: &AppState, cfg: &BackupConfig) -> anyhow::Result<(Stri
     })
     .await??;
     std::fs::rename(&tmp_path, &final_path)?;
-    let _ = std::fs::remove_dir_all(&staging);
     prune(&dir, cfg.keep)?;
     Ok((name, size, pause_ms))
 }
 
+async fn copy_template_pdfs(state: &AppState, snapshot_dir: &Path) -> anyhow::Result<()> {
+    let mut conn = SqliteConnectOptions::new().filename(snapshot_dir.join("pdfsign.db")).read_only(true).connect().await
+        .context("opening the snapshot")?;
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM templates").fetch_all(&mut conn).await.context("reading templates")?;
+    conn.close().await?;
+    for id in ids {
+        anyhow::ensure!(uuid::Uuid::parse_str(&id).is_ok(), "invalid template id {id}");
+        let name = format!("{id}.pdf");
+        tokio::fs::copy(state.cfg.data_dir.join("templates").join(&name), snapshot_dir.join("templates").join(&name))
+            .await
+            .with_context(|| format!("copying template PDF {id} (deleted during the backup? retry)"))?;
+    }
+    Ok(())
+}
+
 fn is_backup_name(n: &str) -> bool {
-    n.starts_with("backup-") && n.ends_with(".zip") && !n.contains('/') && !n.contains("..")
+    n.strip_prefix("backup-").and_then(|n| n.strip_suffix(".zip"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'))
 }
 
 pub fn list_backups(dir: &Path) -> Vec<BackupFile> {
@@ -308,6 +367,9 @@ pub fn list_backups(dir: &Path) -> Vec<BackupFile> {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
+            if !e.file_type().ok()?.is_file() {
+                return None;
+            }
             let meta = e.metadata().ok()?;
             is_backup_name(&name).then(|| BackupFile {
                 name,
@@ -361,29 +423,180 @@ pub fn spawn_scheduler(state: AppState) {
 /// Opens a staged `pdfsign.db`, runs SQLite's integrity check, and verifies that every
 /// template it references has its PDF in `<dir>/templates`.
 async fn validate_snapshot(dir: &Path) -> anyhow::Result<()> {
-    use sqlx::{ConnectOptions, Connection};
     let db = dir.join("pdfsign.db");
-    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
-        .filename(&db)
-        .create_if_missing(false)
-        .connect()
-        .await
-        .with_context(|| format!("opening {}", db.display()))?;
-    let check: Vec<(String,)> = sqlx::query_as("PRAGMA integrity_check").fetch_all(&mut conn).await.context("integrity check")?;
-    if check.len() != 1 || check[0].0 != "ok" {
-        bail!("database integrity check failed: {}", check.iter().map(|c| c.0.as_str()).take(5).collect::<Vec<_>>().join("; "));
-    }
+    let mut conn = checked_database(&db).await?;
     let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM templates").fetch_all(&mut conn).await.context("reading templates")?;
     sqlx::query("SELECT COUNT(*) FROM submissions").execute(&mut conn).await.context("reading submissions")?;
     conn.close().await?;
-    let missing: Vec<&str> = ids.iter().map(|(id,)| id.as_str()).filter(|id| !dir.join("templates").join(format!("{id}.pdf")).is_file()).collect();
+    let missing: Vec<&str> = ids.iter().map(|(id,)| id.as_str()).filter(|id| {
+        uuid::Uuid::parse_str(id).is_err() || !dir.join("templates").join(format!("{id}.pdf")).is_file()
+    }).collect();
     if !missing.is_empty() {
         bail!("{} template PDF(s) missing: {}", missing.len(), missing.join(", "));
     }
     Ok(())
 }
 
-const DB_FILES: [&str; 3] = ["pdfsign.db", "pdfsign.db-wal", "pdfsign.db-shm"];
+async fn checked_database(path: &Path) -> anyhow::Result<SqliteConnection> {
+    let mut conn = SqliteConnectOptions::new().filename(path).read_only(true).connect().await
+        .with_context(|| format!("opening {}", path.display()))?;
+    let check: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check").fetch_all(&mut conn).await.context("integrity check")?;
+    anyhow::ensure!(check.len() == 1 && check[0] == "ok", "database integrity check failed for {}", path.display());
+    Ok(conn)
+}
+
+async fn validate_calendar_snapshot(path: &Path) -> anyhow::Result<()> {
+    let mut conn = checked_database(path).await?;
+    for table in ["events", "event_rsvps", "event_credentials", "webhook_outbox"] {
+        anyhow::ensure!(has_table(&mut conn, table).await?, "calendar snapshot is missing {table}");
+    }
+    conn.close().await?;
+    Ok(())
+}
+
+async fn has_table(conn: &mut SqliteConnection, table: &str) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?)")
+        .bind(table).fetch_one(conn).await
+}
+
+async fn writable_snapshot(path: &Path) -> anyhow::Result<SqliteConnection> {
+    Ok(SqliteConnectOptions::new().filename(path)
+        .pragma("secure_delete", "ON").pragma("trusted_schema", "OFF")
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete).connect().await?)
+}
+
+const SESSION_TABLES: [(&str, &str); 3] = [
+    ("user_sessions", "DELETE FROM user_sessions"),
+    ("signer_sessions", "DELETE FROM signer_sessions"),
+    ("oidc_states", "DELETE FROM oidc_states"),
+];
+
+async fn clear_signing_sessions(dir: &Path) -> anyhow::Result<()> {
+    let mut conn = writable_snapshot(&dir.join("pdfsign.db")).await?;
+    clear_tables(&mut conn, &SESSION_TABLES).await?;
+    conn.close().await?;
+    Ok(())
+}
+
+async fn clear_tables(conn: &mut SqliteConnection, tables: &[(&str, &'static str)]) -> anyhow::Result<()> {
+    for &(table, delete) in tables {
+        if has_table(conn, table).await? {
+            sqlx::query(delete).execute(&mut *conn).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn retire_signing_credentials(dir: &Path) -> anyhow::Result<()> {
+    let mut conn = writable_snapshot(&dir.join("pdfsign.db")).await?;
+    let mut tx = conn.begin().await?;
+    clear_tables(&mut tx, &SESSION_TABLES).await?;
+    clear_tables(&mut tx, &[("api_keys", "DELETE FROM api_keys")]).await?;
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM submissions").fetch_all(&mut *tx).await?;
+    for id in ids {
+        sqlx::query("UPDATE submissions SET token = ?, failed_attempts = 0 WHERE id = ?")
+            .bind(random_token(26)).bind(id).execute(&mut *tx).await?;
+    }
+    if has_table(&mut tx, "public_links").await? {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM public_links").fetch_all(&mut *tx).await?;
+        for id in ids {
+            sqlx::query("UPDATE public_links SET token = ?, active = 0 WHERE id = ?")
+                .bind(random_token(26)).bind(id).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+    conn.close().await?;
+    Ok(())
+}
+
+async fn retire_calendar_credentials(path: &Path) -> anyhow::Result<()> {
+    let mut conn = writable_snapshot(path).await?;
+    let mut tx = conn.begin().await?;
+    clear_tables(&mut tx, &[
+        ("event_credentials", "DELETE FROM event_credentials"),
+        ("webhook_outbox", "DELETE FROM webhook_outbox"),
+    ]).await?;
+    tx.commit().await?;
+    conn.close().await?;
+    Ok(())
+}
+
+const CALENDAR_FILES: [&str; 3] = [CALENDAR_DB, "calendar.sqlite-wal", "calendar.sqlite-shm"];
+const SIGNING_FILES: [&str; 4] = ["pdfsign.db", "pdfsign.db-wal", "pdfsign.db-shm", "templates"];
+
+pub struct RestoreResult {
+    pub signing_previous: Option<PathBuf>,
+    pub calendar_previous: Option<PathBuf>,
+    pub calendar_restored: bool,
+}
+
+struct RestoreFiles {
+    root: PathBuf,
+    staging: PrivateDir,
+    previous: Option<PrivateDir>,
+    names: &'static [&'static str],
+    moved: Vec<&'static str>,
+    installed: Vec<&'static str>,
+}
+
+impl RestoreFiles {
+    fn new(root: &Path, names: &'static [&'static str], force: bool) -> anyhow::Result<Self> {
+        if names.iter().any(|name| root.join(name).symlink_metadata().is_ok()) && !force {
+            bail!("{} already contains data; stop the service and pass --force to restore", root.display());
+        }
+        std::fs::create_dir_all(root)?;
+        let staging = PrivateDir::create(root, "restore")?;
+        Ok(Self { root: root.to_path_buf(), staging, previous: None, names, moved: Vec::new(), installed: Vec::new() })
+    }
+
+    fn install(&mut self) -> anyhow::Result<()> {
+        for &name in self.names {
+            let current = self.root.join(name);
+            match current.symlink_metadata() {
+                Ok(_) => {
+                    if self.previous.is_none() {
+                        self.previous = Some(PrivateDir::create(&self.root, "pre-restore")?);
+                    }
+                    let previous = self.previous.as_ref().unwrap();
+                    std::fs::rename(current, previous.0.join(name)).with_context(|| format!("moving {name} aside"))?;
+                    self.moved.push(name);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        for &name in self.names {
+            let path = self.staging.0.join(name);
+            if path.exists() {
+                std::fs::rename(path, self.root.join(name)).with_context(|| format!("installing {name}"))?;
+                self.installed.push(name);
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback(&mut self, errors: &mut Vec<String>) {
+        for &name in self.installed.iter().rev() {
+            let path = self.root.join(name);
+            let result = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+            if let Err(error) = result {
+                errors.push(format!("removing {}: {error}", path.display()));
+            }
+        }
+        if let Some(previous) = self.previous.take() {
+            let mut failed = false;
+            for &name in self.moved.iter().rev() {
+                if let Err(error) = std::fs::rename(previous.0.join(name), self.root.join(name)) {
+                    errors.push(format!("restoring {name}: {error}"));
+                    failed = true;
+                }
+            }
+            if failed {
+                errors.push(format!("remaining previous data is in {}", previous.keep().display()));
+            }
+        }
+    }
+}
 
 /// Restores a backup archive into `data_dir`. The server must not be running.
 ///
@@ -391,85 +604,93 @@ const DB_FILES: [&str; 3] = ["pdfsign.db", "pdfsign.db-wal", "pdfsign.db-shm"];
 /// (SQLite integrity, template PDFs). Only then is the current database and template folder
 /// moved to `.pre-restore-<stamp>` and the staged copy moved in. If installing fails, the
 /// previous data is moved back. Returns the folder holding the previous data, if any.
-pub async fn restore(archive: &Path, data_dir: &Path, force: bool) -> anyhow::Result<Option<PathBuf>> {
-    let db = data_dir.join("pdfsign.db");
-    if db.exists() && !force {
-        bail!("{} exists - stop the server and pass --force to overwrite it", db.display());
-    }
-    let mut zip = zip::ZipArchive::new(std::fs::File::open(archive).with_context(|| format!("opening {}", archive.display()))?)?;
+pub async fn restore(
+    archive: &Path, data_dir: &Path, calendar_dir: Option<&Path>, signing_only: bool, force: bool,
+) -> anyhow::Result<RestoreResult> {
+    let mut zip = zip::ZipArchive::new(File::open(archive).with_context(|| format!("opening {}", archive.display()))?)?;
     if zip.by_name("pdfsign.db").is_err() {
         bail!("{} is not a pdfsign backup", archive.display());
     }
-    std::fs::create_dir_all(data_dir)?;
-    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let staging = data_dir.join(format!(".restore-{stamp}"));
+    let format = match zip.by_name("manifest.json") {
+        Ok(entry) => serde_json::from_reader::<_, serde_json::Value>(entry.take(64 * 1024)).ok().and_then(|m| m["format"].as_u64()),
+        Err(_) => None,
+    };
+    anyhow::ensure!(format == Some(BACKUP_FORMAT), "{} was made by an earlier pdfsign version and cannot be restored", archive.display());
+    let includes_calendar = zip.by_name(CALENDAR_DB).is_ok();
+    anyhow::ensure!(!includes_calendar || calendar_dir.is_some() || signing_only,
+        "this archive includes calendar data; pass --calendar-data-dir or explicitly select --signing-only");
+    anyhow::ensure!(includes_calendar || calendar_dir.is_none(), "this archive does not contain calendar data");
+    let mut signing = RestoreFiles::new(data_dir, &SIGNING_FILES, force)?;
+    let mut calendar = calendar_dir.map(|dir| RestoreFiles::new(dir, &CALENDAR_FILES, force)).transpose()?;
+    if let Some(calendar) = &calendar {
+        let signing_root = data_dir.canonicalize()?;
+        let calendar_root = calendar.root.canonicalize()?;
+        anyhow::ensure!(calendar_root != signing_root && !calendar_root.starts_with(signing_root.join("templates")),
+            "calendar data must be outside the signing template directory");
+    }
+    let staging = &signing.staging.0;
     let staged = async {
-        std::fs::create_dir_all(staging.join("templates"))?;
+        std::fs::create_dir(staging.join("templates"))?;
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i)?;
             let name = entry.name()?.to_string();
             let target = match name.as_str() {
                 "pdfsign.db" => staging.join("pdfsign.db"),
-                n if n.starts_with("templates/") && n.ends_with(".pdf") && !n.contains("..") && n.matches('/').count() == 1 => staging.join(n),
+                CALENDAR_DB => {
+                    let Some(calendar) = &calendar else { continue };
+                    anyhow::ensure!(entry.size() <= CALENDAR_MAX_BYTES as u64, "calendar snapshot exceeds 128 MiB");
+                    calendar.staging.0.join(CALENDAR_DB)
+                }
+                n if n.strip_prefix("templates/").and_then(|n| n.strip_suffix(".pdf"))
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()) => staging.join(n),
                 _ => continue,
             };
-            let mut out = std::fs::File::create(&target)?;
-            std::io::copy(&mut entry, &mut out)?;
+            let mut out = private_file(&target)?;
+            if name == CALENDAR_DB {
+                let copied = std::io::copy(&mut entry.take(CALENDAR_MAX_BYTES as u64 + 1), &mut out)?;
+                anyhow::ensure!(copied <= CALENDAR_MAX_BYTES as u64, "calendar snapshot exceeds 128 MiB");
+            } else {
+                std::io::copy(&mut entry, &mut out)?;
+            }
             out.sync_all()?;
         }
-        validate_snapshot(&staging).await
+        validate_snapshot(staging).await?;
+        retire_signing_credentials(staging).await?;
+        if let Some(calendar) = &calendar {
+            let snapshot = calendar.staging.0.join(CALENDAR_DB);
+            validate_calendar_snapshot(&snapshot).await?;
+            retire_calendar_credentials(&snapshot).await?;
+        }
+        Ok::<_, anyhow::Error>(())
     }
     .await;
     if let Err(e) = staged {
-        let _ = std::fs::remove_dir_all(&staging);
         return Err(e.context(format!("{} was not restored; the current data is unchanged", archive.display())));
     }
 
-    // move the current data aside
-    let previous = data_dir.join(format!(".pre-restore-{stamp}"));
-    let mut moved: Vec<&str> = Vec::new();
-    let current: Vec<&str> = DB_FILES.iter().copied().chain(["templates"]).filter(|n| data_dir.join(n).exists()).collect();
     let install = (|| -> anyhow::Result<()> {
-        if !current.is_empty() {
-            std::fs::create_dir_all(&previous)?;
-        }
-        for n in &current {
-            std::fs::rename(data_dir.join(n), previous.join(n)).with_context(|| format!("moving {n} aside"))?;
-            moved.push(n);
-        }
-        for n in DB_FILES.iter().copied().chain(["templates"]) {
-            if staging.join(n).exists() {
-                std::fs::rename(staging.join(n), data_dir.join(n)).with_context(|| format!("installing {n}"))?;
-            }
+        signing.install()?;
+        if let Some(calendar) = &mut calendar {
+            calendar.install()?;
         }
         Ok(())
     })();
     if let Err(e) = install {
-        // roll back: drop what was installed, put the previous data back
-        for n in DB_FILES.iter().copied().chain(["templates"]) {
-            if moved.contains(&n) || !current.contains(&n) {
-                let p = data_dir.join(n);
-                if p.is_dir() {
-                    let _ = std::fs::remove_dir_all(&p);
-                } else {
-                    let _ = std::fs::remove_file(&p);
-                }
-            }
-        }
         let mut rollback_errors = Vec::new();
-        for n in &moved {
-            if let Err(re) = std::fs::rename(previous.join(n), data_dir.join(n)) {
-                rollback_errors.push(format!("{n}: {re}"));
-            }
+        if let Some(calendar) = &mut calendar {
+            calendar.rollback(&mut rollback_errors);
         }
+        signing.rollback(&mut rollback_errors);
         if rollback_errors.is_empty() {
-            let _ = std::fs::remove_dir(&previous);
             return Err(e.context("restore failed; the previous data was put back"));
         }
-        return Err(e.context(format!("restore failed and rollback was incomplete ({}); the previous data is in {}", rollback_errors.join(", "), previous.display())));
+        return Err(e.context(format!("restore failed and rollback was incomplete: {}", rollback_errors.join(", "))));
     }
-    let _ = std::fs::remove_dir_all(&staging);
-    Ok((!current.is_empty()).then_some(previous))
+    Ok(RestoreResult {
+        signing_previous: signing.previous.take().map(PrivateDir::keep),
+        calendar_restored: calendar.is_some(),
+        calendar_previous: calendar.and_then(|mut files| files.previous.take().map(PrivateDir::keep)),
+    })
 }
 
 #[cfg(test)]

@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- pdfsign and DIY Calendar can be installed as standalone web apps on iPhone, Android, and desktop Chrome.
+
+## [0.0.4] - 2026-11-26
+
+### Upgrading
+
+- **0.0.4 needs a fresh data folder.** pdfsign no longer migrates databases from earlier versions, and `pdfsign restore` refuses backups from 0.0.3 and earlier. Start with an empty `DATA_DIR` and re-import from DocuSeal if needed. The calendar database is new in this release.
+- Docker Compose no longer starts the bot by default. Start it with `docker compose up -d bot`. For events, see the README's `--profile calendar` command.
+- `TRUSTED_PROXIES` now defaults to empty instead of loopback and private networks, and `X-Real-IP` is no longer read. Behind a reverse proxy, set `TRUSTED_PROXIES` to the proxy's address and make the proxy send `X-Forwarded-For`. Otherwise all visitors share one rate limit, and pdfsign logs a warning.
+- With authentik configured, pdfsign refuses to start unless `PUBLIC_URL` is an HTTPS origin without a path. Plain HTTP is accepted only for `localhost`, `127.0.0.1` and `[::1]`. `MAX_NAME_ATTEMPTS` must be greater than 0.
+- QR links now need a zip code on file. Before relying on a QR link, add zip codes under **People** for people who were created by staff or imported without one.
+- Restoring a backup now disables all general (QR) links and gives them new URLs, so printed QR codes stop working until you re-enable the links and share them again. Restoring also deletes all API keys, so the bot needs a new `PDFSIGN_API_KEY`, and gives every personal signing link a new token.
+- A bot with `EVENTS_ENABLED=true` requires `PUBLIC_URL`.
+- DocuSeal imports ignore `HTTP_PROXY` and `HTTPS_PROXY`. pdfsign must reach DocuSeal and its file storage directly.
+- The container image creates `/data`, `/export` and `/backups` owned by user 10001 with mode `0700`. The bundled Compose file uses bind mounts and is unaffected. With named volumes and another `user:`, fix the volume ownership.
+
+### Added
+
+- The new calendar service runs standalone. It has a month view, a daily agenda, an event editor, an authenticated API, an iCalendar feed, and outgoing webhooks. Each webhook delivery is attempted up to eight times, and pending deliveries survive a restart.
+- With `EVENTS_ENABLED=true`, pdfsign manages events and RSVPs under **Events**. It reads and writes the calendar's SQLite database through the calendar service, using a shared `CALENDAR_PDFSIGN_TOKEN`. Admins and staff can create, edit, and cancel events. pdfsign does not delete events. To let other members view events and RSVP, set `OIDC_EVENT_GROUP` to an authentik group. Members of that group can open only the event pages.
+- Under **Events → Calendars & API**, admins can generate a private iCalendar feed and issue read-only or read/write tokens for `/api/events/v1/events`.
+- The Discord bot's `!event list`, `create`, `show`, `edit`, and `cancel` commands send a DM link to the authentik-protected event pages. The bot needs a reachable calendar connected to pdfsign. With events enabled, it exits at startup if the calendar is unreachable and refuses event commands while it is down.
+- The bot can run with only event commands. Leave `PDFSIGN_API_KEY` blank and set `EVENTS_ENABLED=true`.
+- `pdfsign restore` accepts `--calendar-data-dir` to restore the calendar database from a combined archive, or `--signing-only` to skip it. A combined archive is refused without one of them.
+- `DELETE /api/admin/users/{id}/sessions` ends all sessions of a user (admin only).
+
+### Changed
+
+- Docker Compose places the Discord bot in the optional `bot` profile and the calendar in the optional `calendar` profile. Start the bot explicitly with `docker compose up -d bot`, or enable the profile.
+- The reset under **API & export** is now labeled **Delete all signing data**. It does not delete calendar events.
+- General (QR) links always ask for the zip code together with the name. People with a registered name but no zip code on file must ask staff to add one before they can use a QR link. A name and zip code that match nobody create a new person, even when someone with that name is registered under another zip code. Merge such duplicates under **People**.
+- Registering again through the Discord bot with a different name is refused (`409 already_registered` on `PUT /api/v1/persons/{discord_id}`), and a zip code on file is never replaced. Repeating the registered name in another spelling is accepted. Staff change names under **People**.
+- Backup archives are named `backup-YYYYMMDD-HHMMSS-mmm-<random>.zip`.
+- Template fields accept font sizes up to 96 pt.
+- Export and backup folders must be absolute paths outside the published web folder, the data folder itself and its template folder. A relative `DATA_DIR`, `EXPORT_DIR` or `BACKUP_DIR` is resolved against the working directory at startup, so the default folders keep working.
+- ZIP exports and backup downloads are streamed from temporary files instead of memory. At most two background exports run at once.
+
+### Removed
+
+- Startup migrations for databases from earlier versions (added columns, name-key backfill and repair).
+- The synchronous `POST /api/admin/export` and `GET /api/admin/export.zip`. Use the export jobs under `/api/admin/export/jobs`.
+- The bot's startup cleanup of the slash commands from 0.0.2 and earlier, and the `REGISTER_COMMANDS` variable.
+- DocuSeal imports no longer recognize records imported before source keys were qualified by the DocuSeal instance.
+
+### Security
+
+- DocuSeal requests validate every destination and cap download sizes (32 MiB per PDF, 8 MiB per API response or signature image). Private or HTTP DocuSeal instances now require an exact origin in `DOCUSEAL_TRUSTED_ORIGINS`. API redirects must stay on the configured origin, and upstream error bodies are no longer shown.
+- Authentik discovery requires the exact HTTPS issuer, and ID tokens are signature-verified. New sessions last 15 minutes, and admins can revoke a user's sessions from **API & export**.
+- ID tokens must name pdfsign as their only audience, and an `azp` claim must match the client ID. A login without access to any pdfsign group ends that user's existing sessions, and so does a role change.
+- Personal signing attempts are counted atomically and rate-limited by client IP. QR links respect the lock on an existing submission. Each client can create at most 10 new people through QR links and download at most 60 signed PDFs per 10 minutes.
+- `TRUSTED_PROXIES` no longer trusts private networks by default, and `X-Real-IP` is ignored. Only `X-Forwarded-For` from listed proxies is believed.
+- QR sign-in requires the zip code on file, so a name alone no longer opens someone's document. QR sessions use a temporary `qr-…` page address and never return the personal signing link.
+- Signature uploads must be PNG images. Images are decoded with size limits (4000 px per side), off the request threads.
+- Admin requests that a browser marks as cross-site are refused, and a cross-site link cannot log you out.
+- Responses carry a Content-Security-Policy, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy: no-referrer`, and HSTS for HTTPS deployments.
+- Internal server errors no longer include database, file or upstream details in the response. They are recorded in the activity log.
+- Exported `index.csv` cells that a spreadsheet would run as a formula are prefixed with an apostrophe.
+- The rate limiter groups IPv6 clients by /64 and no longer refuses all new clients when its table is full. Login starts are rate-limited, and pdfsign warns when `X-Forwarded-For` arrives from a proxy missing from `TRUSTED_PROXIES`.
+- The container image creates `/data`, `/export` and `/backups` owner-only instead of world-writable. If you run the image with named volumes as a user other than 10001, set the volume ownership yourself.
+- CI audits Rust and Bun dependencies for known vulnerabilities.
+- New backups use owner-only file permissions on Unix and include calendar data when events are enabled. Backups no longer contain login or signing sessions. Restoring deletes API keys, gives personal signing links new tokens, and disables general links under new URLs. Combined restores also retire calendar credentials and clear queued webhook deliveries.
+
+### Performance
+
+- PDF rendering, template parsing and image decoding run on the blocking thread pool, at most one job per CPU core, so renders no longer stall other requests. Parsed template PDFs are cached.
+- QR identification looks names up through an indexed key instead of scanning every person. Exports no longer look up each document's person twice. The template list and the bot's person view use single queries.
+- New indexes for signer sessions, signing rounds, general links, user sessions and the activity log. Bot requests update a key's last use at most every five minutes.
+- Backups copy template PDFs after the write pause instead of during it. OIDC signing keys are cached for ten minutes.
+
 ## [0.0.3] - 2026-11-26
 
 ### Added
@@ -78,7 +149,8 @@ These actions require the admin role.
 - authentik (OIDC) login with admin and staff roles, and a bot API with API tokens.
 - Discord bot.
 
-[Unreleased]: https://github.com/Voxel07/pdf/compare/0.0.3...HEAD
+[Unreleased]: https://github.com/Voxel07/pdf/compare/0.0.4...HEAD
+[0.0.4]: https://github.com/Voxel07/pdf/compare/0.0.3...0.0.4
 [0.0.3]: https://github.com/Voxel07/pdf/compare/0.0.2...0.0.3
 [0.0.2]: https://github.com/Voxel07/pdf/compare/0.0.1...0.0.2
 [0.0.1]: https://github.com/Voxel07/pdf/releases/tag/0.0.1

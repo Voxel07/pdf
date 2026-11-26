@@ -4,7 +4,8 @@
   import AdminApp from './routes/admin/AdminApp.svelte';
   import PublicLink from './routes/PublicLink.svelte';
 
-  const signToken = $derived(/^\/s\/([A-Za-z0-9]+)\/?$/.exec(route.path)?.[1]);
+  // a personal link token, or the `qr-` handle of a session opened through a general link
+  const signToken = $derived(/^\/s\/((?:qr-)?[A-Za-z0-9]+)\/?$/.exec(route.path)?.[1]);
   const linkToken = $derived(/^\/p\/([A-Za-z0-9]+)\/?$/.exec(route.path)?.[1]);
 </script>
 

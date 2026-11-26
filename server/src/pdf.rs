@@ -17,8 +17,8 @@ pub enum DrawValue {
     Image(Vec<u8>),
 }
 
-pub struct DrawItem<'a> {
-    pub field: &'a Field,
+pub struct DrawItem {
+    pub field: Field,
     pub value: DrawValue,
 }
 
@@ -45,6 +45,26 @@ pub fn page_count(bytes: &[u8]) -> Result<usize> {
     Ok(load(bytes)?.get_pages().len())
 }
 
+/// Largest image (either side, in pixels) accepted from signers and imports.
+pub const MAX_IMAGE_SIDE: u32 = 4000;
+
+/// Decodes an image with explicit limits, so a small file that declares huge dimensions
+/// (a decompression bomb) is rejected before any pixel buffer is allocated. `format`
+/// restricts the decoder; `None` guesses it from the content.
+pub fn decode_image(bytes: &[u8], format: Option<image::ImageFormat>) -> Result<image::DynamicImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
+    match format {
+        Some(f) => reader.set_format(f),
+        None => reader = reader.with_guessed_format()?,
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    limits.max_alloc = Some(96 * 1024 * 1024);
+    reader.limits(limits);
+    Ok(reader.decode()?)
+}
+
 fn save(doc: &mut Document) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     doc.save_to(&mut out).context("could not write PDF")?;
@@ -52,8 +72,9 @@ fn save(doc: &mut Document) -> Result<Vec<u8>> {
 }
 
 /// Draws the given items onto the template and optionally appends audit pages.
-pub fn render(template: &[u8], items: &[DrawItem], audit: Option<&[AuditLine]>) -> Result<Vec<u8>> {
-    let mut doc = load(template)?;
+/// `template` is the parsed template (see [`load`]); it is copied, never changed.
+pub fn render(template: &Document, items: &[DrawItem], audit: Option<&[AuditLine]>) -> Result<Vec<u8>> {
+    let mut doc = template.clone();
     let pages = doc.get_pages();
 
     let font_r = add_font(&mut doc, "Helvetica");
@@ -76,7 +97,7 @@ pub fn render(template: &[u8], items: &[DrawItem], audit: Option<&[AuditLine]>) 
         content.push_str(&format!("{} {} {} {} {} {} cm\n", n(a), n(b), n(c), n(d), n(e), n(f)));
 
         for it in page_items {
-            let fld = it.field;
+            let fld = &it.field;
             // box in display space (origin bottom-left, y up)
             let bw = fld.w * geo.dw;
             let bh = fld.h * geo.dh;
@@ -281,7 +302,7 @@ fn zlib(data: &[u8]) -> Vec<u8> {
 
 /// Adds an image XObject (RGB + alpha SMask) and returns (id, width, height).
 fn image_xobject(doc: &mut Document, bytes: &[u8]) -> Result<(ObjectId, u32, u32)> {
-    let img = image::load_from_memory(bytes)?.to_rgba8();
+    let img = decode_image(bytes, None)?.to_rgba8();
     let (w, h) = img.dimensions();
     let mut rgb = Vec::with_capacity((w * h * 3) as usize);
     let mut alpha = Vec::with_capacity((w * h) as usize);
@@ -393,11 +414,15 @@ fn wrap(text: &str, size: f64, max_w: f64) -> Vec<Vec<u8>> {
     lines
 }
 
+/// Largest font size a field may use.
+pub const MAX_FONT_SIZE: f64 = 96.0;
+
 /// Content-stream snippet drawing `text` into the given box (auto-shrinks & wraps).
 fn text_box(text: &str, x: f64, y: f64, w: f64, h: f64, font_size: Option<f32>) -> String {
     let pad = 2.0_f64.min(w * 0.05);
     let avail_w = (w - 2.0 * pad).max(1.0);
-    let start = font_size.map(|s| s as f64).unwrap_or_else(|| (h * 0.68).clamp(6.0, 12.0));
+    // the shrink loop below runs once per half point, so the start size is bounded
+    let start = font_size.map(|s| (s as f64).clamp(5.0, MAX_FONT_SIZE)).unwrap_or_else(|| (h * 0.68).clamp(6.0, 12.0));
     let mut size = start;
     let mut lines;
     loop {
@@ -634,15 +659,31 @@ pub(crate) mod tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
         let items = vec![
-            DrawItem { field: &f1, value: DrawValue::Text("Jürgen Müller – 42 €".into()) },
-            DrawItem { field: &f2, value: DrawValue::Image(png) },
+            DrawItem { field: f1, value: DrawValue::Text("Jürgen Müller – 42 €".into()) },
+            DrawItem { field: f2, value: DrawValue::Image(png) },
         ];
         let audit = vec![AuditLine::Title("Audit".into()), AuditLine::Kv("Key".into(), "Value".into())];
-        let out = render(&pdf, &items, Some(&audit)).unwrap();
+        let out = render(&load(&pdf).unwrap(), &items, Some(&audit)).unwrap();
         assert_eq!(page_count(&out).unwrap(), 2);
         let (merged, offsets) = merge(&[out.clone(), pdf.clone()]).unwrap();
         assert_eq!(page_count(&merged).unwrap(), 3);
         assert_eq!(offsets, vec![0, 2]);
         std::fs::write(std::env::temp_dir().join("pdfsign-test.pdf"), &out).unwrap();
+    }
+
+    #[test]
+    fn oversized_images_and_fonts_are_bounded() {
+        // a tiny PNG header that claims 100000 x 100000 pixels must be rejected up front
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png[16..20].copy_from_slice(&100_000u32.to_be_bytes());
+        png[20..24].copy_from_slice(&100_000u32.to_be_bytes());
+        assert!(decode_image(&png, Some(image::ImageFormat::Png)).is_err());
+        // a huge font size finishes quickly instead of shrinking half a point at a time
+        let started = std::time::Instant::now();
+        text_box(&"word ".repeat(400), 0.0, 0.0, 50.0, 10.0, Some(1e9));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

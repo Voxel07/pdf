@@ -6,6 +6,7 @@
 //! warning and error is also written to the activity log.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -20,6 +21,10 @@ use crate::service::{self, *};
 use crate::state::AppState;
 use crate::util::*;
 
+const API_MAX_BYTES: usize = 8 * 1024 * 1024;
+const SIGNATURE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const PDF_MAX_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Connection {
     /// API base, e.g. `https://api.docuseal.com`, `https://api.docuseal.eu` or
@@ -33,8 +38,8 @@ fn upstream(e: anyhow::Error) -> AppError {
 }
 
 pub struct Client {
-    http: reqwest::Client,
-    base: String,
+    base: reqwest::Url,
+    trusted_origins: Vec<reqwest::Url>,
     key: String,
     /// `host[:port][/path]` of the API base; qualifies imported IDs so two DocuSeal
     /// instances with overlapping numeric IDs don't collide.
@@ -54,49 +59,100 @@ pub struct TemplateSummary {
 
 impl Client {
     pub fn new(c: Connection) -> AppResult<Self> {
-        let mut base = c.base_url.trim().trim_end_matches('/').to_string();
-        if base.is_empty() {
-            base = "https://api.docuseal.com".into();
-        }
-        if !base.starts_with("http://") && !base.starts_with("https://") {
-            return Err(AppError::bad_request("base_url must start with http(s)://"));
+        let allowed = std::env::var("DOCUSEAL_TRUSTED_ORIGINS").unwrap_or_default();
+        Self::with_trusted_origins(c, &allowed)
+    }
+
+    fn with_trusted_origins(c: Connection, allowed: &str) -> AppResult<Self> {
+        let base = match c.base_url.trim() {
+            "" => "https://api.docuseal.com",
+            value => value,
+        };
+        let base = outbound_url(base).map_err(|_| AppError::bad_request("enter a valid DocuSeal API URL without credentials or a fragment"))?;
+        if base.query().is_some() {
+            return Err(AppError::bad_request("the DocuSeal API URL must not include a query"));
         }
         if c.api_key.trim().is_empty() {
             return Err(AppError::bad_request("api_key is required"));
         }
-        let http = reqwest::Client::builder()
-            .user_agent("pdfsign-importer")
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|e| anyhow!(e))?;
-        let url = reqwest::Url::parse(&base).map_err(|e| AppError::bad_request(format!("invalid base_url: {e}")))?;
+        let trusted_origins = allowed.split(',').map(str::trim).filter(|s| !s.is_empty())
+            .map(|value| {
+                outbound_url(value).ok().filter(|url| url.path() == "/" && url.query().is_none())
+                    .ok_or_else(|| AppError::bad_request("DOCUSEAL_TRUSTED_ORIGINS must contain HTTP(S) origins without paths or queries"))
+            })
+            .collect::<AppResult<Vec<_>>>()?;
         let instance = format!(
             "{}{}{}",
-            url.host_str().unwrap_or_default().to_lowercase(),
-            url.port().map(|p| format!(":{p}")).unwrap_or_default(),
-            url.path().trim_end_matches('/')
+            base.host_str().unwrap_or_default().to_lowercase(),
+            base.port().map(|p| format!(":{p}")).unwrap_or_default(),
+            base.path().trim_end_matches('/')
         );
-        Ok(Self { http, base, key: c.api_key.trim().to_string(), instance })
+        Ok(Self { base, trusted_origins, key: c.api_key.trim().to_string(), instance })
     }
 
-    /// `(qualified, legacy)` source keys for an upstream object. Imports before instance
-    /// qualification stored the bare `docuseal:<kind>:<id>`; those are still recognized.
-    fn source_keys(&self, kind: &str, id: i64) -> (String, String) {
-        (format!("docuseal:{}:{kind}:{id}", self.instance), format!("docuseal:{kind}:{id}"))
+    /// The source key of an upstream object, qualified by the instance.
+    fn source_key(&self, kind: &str, id: i64) -> String {
+        format!("docuseal:{}:{kind}:{id}", self.instance)
     }
 
-    /// The API token is only sent to the configured instance, never to other hosts that
-    /// file URLs may point to (e.g. a storage bucket).
-    fn same_origin(&self, url: &str) -> bool {
-        match (reqwest::Url::parse(&self.base), reqwest::Url::parse(url)) {
-            (Ok(a), Ok(b)) => a.scheme() == b.scheme() && a.host_str() == b.host_str() && a.port_or_known_default() == b.port_or_known_default(),
-            _ => false,
+    async fn client_for(&self, url: &reqwest::Url) -> anyhow::Result<reqwest::Client> {
+        let host = url.host_str().context("missing DocuSeal destination host")?;
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent("pdfsign-importer")
+            .timeout(Duration::from_secs(60));
+        if !self.trusted_origins.iter().any(|trusted| trusted.origin() == url.origin()) {
+            if url.scheme() != "https" {
+                bail!("DocuSeal destinations must use HTTPS unless explicitly configured");
+            }
+            if let Ok(ip) = host.trim_matches(['[', ']']).parse() {
+                if !public_address(ip) {
+                    bail!("DocuSeal destination is not a public address");
+                }
+            } else {
+                let port = url.port_or_known_default().context("missing DocuSeal destination port")?;
+                let addresses: Vec<_> = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, port)))
+                    .await.context("DocuSeal DNS lookup timed out")?
+                    .context("could not resolve the DocuSeal destination")?
+                    .collect();
+                if addresses.is_empty() || addresses.iter().any(|address| !public_address(address.ip())) {
+                    bail!("DocuSeal destination does not resolve exclusively to public addresses");
+                }
+                builder = builder.resolve_to_addrs(host, &addresses);
+            }
         }
+        Ok(builder.build()?)
+    }
+
+    async fn fetch(&self, mut url: reqwest::Url, use_key: bool, api_request: bool) -> anyhow::Result<reqwest::Response> {
+        for _ in 0..=5 {
+            let same_origin = url.origin() == self.base.origin();
+            if api_request && !same_origin {
+                bail!("DocuSeal API redirects must stay on the configured origin");
+            }
+            let client = self.client_for(&url).await?;
+            let result = self.send_retrying(|| {
+                let request = client.get(url.clone());
+                if use_key && same_origin { request.header("X-Auth-Token", &self.key) } else { request }
+            }).await?;
+            if !matches!(result.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                return Ok(result);
+            }
+            let location = result.headers().get(reqwest::header::LOCATION).and_then(|value| value.to_str().ok())
+                .context("DocuSeal redirect has no valid location")?;
+            let next = url.join(location).map_err(|_| anyhow!("invalid DocuSeal redirect destination"))?;
+            url = outbound_url(next.as_str())?;
+            if result.url().scheme() == "https" && url.scheme() != "https" {
+                bail!("DocuSeal redirects cannot downgrade HTTPS");
+            }
+        }
+        bail!("too many DocuSeal redirects");
     }
 
     /// Sends a request, retrying rate limits (429), server errors and network failures with
     /// a growing delay (honouring `Retry-After`), so a long import survives upstream hiccups.
-    async fn send_retrying(&self, what: &str, make: impl Fn() -> reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
+    async fn send_retrying(&self, make: impl Fn() -> reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
         const ATTEMPTS: u32 = 6;
         let mut delay = Duration::from_secs(1);
         let mut attempt = 1;
@@ -111,15 +167,15 @@ impl Client {
                         .and_then(|v| v.trim().parse::<u64>().ok())
                         .map(|s| Duration::from_secs(s.min(120)))
                         .unwrap_or(delay);
-                    tracing::warn!("{what}: {} - retrying in {}s ({attempt}/{ATTEMPTS})", res.status(), wait.as_secs());
+                    tracing::warn!("DocuSeal returned {} - retrying in {}s ({attempt}/{ATTEMPTS})", res.status(), wait.as_secs());
                     tokio::time::sleep(wait).await;
                 }
                 Ok(res) => return Ok(res),
-                Err(e) if !last => {
-                    tracing::warn!("{what}: {e} - retrying in {}s ({attempt}/{ATTEMPTS})", delay.as_secs());
+                Err(_) if !last => {
+                    tracing::warn!("DocuSeal request failed - retrying in {}s ({attempt}/{ATTEMPTS})", delay.as_secs());
                     tokio::time::sleep(delay).await;
                 }
-                Err(e) => return Err(anyhow!(e).context(what.to_string())),
+                Err(e) => return Err(anyhow!(e.without_url()).context("DocuSeal request failed")),
             }
             delay = (delay * 2).min(Duration::from_secs(30));
             attempt += 1;
@@ -127,15 +183,16 @@ impl Client {
     }
 
     async fn get(&self, path: &str, query: &[(&str, String)]) -> anyhow::Result<Value> {
-        let url = format!("{}{}", self.base, path);
-        let what = format!("GET {url}");
-        let res = self.send_retrying(&what, || self.http.get(&url).header("X-Auth-Token", &self.key).query(query)).await?;
+        let mut url = self.base.clone();
+        url.set_path(&format!("{}{}", self.base.path().trim_end_matches('/'), path));
+        url.query_pairs_mut().extend_pairs(query);
+        let res = self.fetch(url, true, true).await?;
         let status = res.status();
         if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
-            bail!("DocuSeal {} returned {}: {}", path, status, body.chars().take(300).collect::<String>());
+            bail!("DocuSeal {} returned {}", path, status);
         }
-        res.json().await.with_context(|| format!("decoding {url}"))
+        let body = read_limited(res, API_MAX_BYTES).await?;
+        serde_json::from_slice(&body).context("invalid DocuSeal API response")
     }
 
     /// Fetches all pages of a list endpoint (`{data, pagination: {next}}`). DocuSeal lists
@@ -173,18 +230,17 @@ impl Client {
 
     /// Downloads a file URL. Tries without credentials first (file URLs are signed), then
     /// with the API token if the URL belongs to the configured instance.
-    async fn download(&self, url: &str) -> anyhow::Result<Vec<u8>> {
-        let what = format!("download {url}");
-        let res = self.send_retrying(&what, || self.http.get(url)).await?;
-        let res = if res.status().is_success() || !self.same_origin(url) {
-            res
-        } else {
-            self.send_retrying(&what, || self.http.get(url).header("X-Auth-Token", &self.key)).await?
-        };
-        if !res.status().is_success() {
-            bail!("download {url} failed: {}", res.status());
+    async fn download(&self, url: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
+        let url = outbound_url(url)?;
+        let mut res = self.fetch(url.clone(), false, false).await?;
+        if matches!(res.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::NOT_FOUND)
+            && url.origin() == self.base.origin() && res.url().origin() == self.base.origin() {
+            res = self.fetch(url, true, false).await?;
         }
-        Ok(res.bytes().await?.to_vec())
+        if !res.status().is_success() {
+            bail!("DocuSeal file download failed: {}", res.status());
+        }
+        read_limited(res, limit).await
     }
 
     pub async fn list_templates(&self) -> AppResult<Vec<TemplateSummary>> {
@@ -201,6 +257,57 @@ impl Client {
                 imported: false,
             })
             .collect())
+    }
+}
+
+fn outbound_url(value: &str) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value).map_err(|_| anyhow!("invalid DocuSeal destination URL"))?;
+    if !matches!(url.scheme(), "https" | "http") || url.host_str().is_none()
+        || !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        bail!("DocuSeal destinations must be HTTP(S) URLs without credentials or fragments");
+    }
+    Ok(url)
+}
+
+fn public_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => !matches!(ip.octets(),
+            [0 | 10 | 127 | 224..=255, ..] | [100, 64..=127, ..] | [169, 254, ..] |
+            [172, 16..=31, ..] | [192, 0, 0 | 2, _] | [192, 88, 99, _] |
+            [192, 168, ..] | [198, 18 | 19, ..] | [198, 51, 100, _] | [203, 0, 113, _]),
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            // Allow global unicast, excluding transition, special-purpose, and documentation ranges.
+            segments[0] & 0xe000 == 0x2000
+                && !matches!(segments, [0x2001, 0..=0x1ff | 0x0db8, ..] | [0x2002 | 0x3fff, ..])
+        }
+    }
+}
+
+#[cfg(test)]
+mod outbound_tests {
+    use super::*;
+
+    #[test]
+    fn outbound_policy_excludes_non_public_addresses() {
+        for address in ["127.0.0.1", "10.0.0.1", "100.64.0.1", "169.254.1.1", "::1", "::ffff:192.168.1.1", "fd00::1", "2001:db8::1"] {
+            assert!(!public_address(address.parse().unwrap()), "{address}");
+        }
+        for address in ["8.8.8.8", "2606:4700::1"] {
+            assert!(public_address(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_private_instance_requires_an_exact_configured_origin() {
+        let base_url = "http://127.0.0.1:3210/api";
+        let config = Connection { base_url: base_url.into(), api_key: "test".into() };
+        let url = outbound_url(base_url).unwrap();
+        assert!(Client::with_trusted_origins(config.clone(), "").unwrap().client_for(&url).await.is_err());
+        let client = Client::with_trusted_origins(config, "http://127.0.0.1:3210").unwrap();
+        assert!(client.client_for(&url).await.is_ok());
+        let other_port = outbound_url("http://127.0.0.1:3211/api").unwrap();
+        assert!(client.client_for(&other_port).await.is_err());
     }
 }
 
@@ -408,7 +515,7 @@ async fn import_template(job: &Run<'_>, client: &Client, ds_id: i64, req: &Impor
     let state = job.state;
     job.phase(format!("loading DocuSeal template {ds_id}"));
     let ds = client.get(&format!("/templates/{ds_id}"), &[]).await.map_err(upstream)?;
-    let (source, legacy_source) = client.source_keys("template", ds_id);
+    let source = client.source_key("template", ds_id);
     let name = ds["name"].as_str().unwrap_or("Imported template").to_string();
     job.update(|p| p.template_name = Some(name.clone()));
 
@@ -423,9 +530,7 @@ async fn import_template(job: &Run<'_>, client: &Client, ds_id: i64, req: &Impor
         .unwrap_or_default();
     let section_of = |submitter_uuid: &str| -> u32 { roles.iter().position(|(u, _)| u == submitter_uuid).unwrap_or(0) as u32 };
 
-    let existing: Option<(String,)> = sqlx::query_as("SELECT id FROM templates WHERE source IN (?, ?) ORDER BY source = ? DESC LIMIT 1")
-        .bind(&source)
-        .bind(&legacy_source)
+    let existing: Option<(String,)> = sqlx::query_as("SELECT id FROM templates WHERE source = ? LIMIT 1")
         .bind(&source)
         .fetch_optional(&state.pool)
         .await?;
@@ -448,7 +553,7 @@ async fn import_template(job: &Run<'_>, client: &Client, ds_id: i64, req: &Impor
         let mut pdfs = Vec::new();
         for d in &sorted {
             let url = d["url"].as_str().ok_or_else(|| anyhow!("document without url"))?;
-            pdfs.push(client.download(url).await.map_err(upstream)?);
+            pdfs.push(client.download(url, PDF_MAX_BYTES).await.map_err(upstream)?);
         }
         let (merged, offsets) = tokio::task::spawn_blocking(move || pdf::merge(&pdfs)).await.map_err(|e| anyhow!(e))??;
         let page_offset: HashMap<String, u32> = sorted
@@ -603,10 +708,9 @@ async fn import_submission(
     req: &ImportRequest,
 ) -> AppResult<Outcome> {
     let state = job.state;
-    let (source, legacy_source) = client.source_keys("submission", sid);
-    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM submissions WHERE source IN (?, ?)")
+    let source = client.source_key("submission", sid);
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM submissions WHERE source = ?")
         .bind(&source)
-        .bind(&legacy_source)
         .fetch_optional(&state.pool)
         .await?;
     if exists.is_some() {
@@ -706,7 +810,7 @@ async fn import_submission(
                             base64::engine::general_purpose::STANDARD.decode(d).ok()
                         })
                     } else {
-                        client.download(url).await.ok()
+                        client.download(url, SIGNATURE_MAX_BYTES).await.ok()
                     };
                     match bytes.and_then(|b| normalize_image(&b).ok()) {
                         Some(png) => (String::new(), Some(png)),
@@ -770,7 +874,7 @@ async fn import_submission(
             docs.push(("audit-log".into(), audit.to_string()));
         }
         for (n, u) in docs {
-            match client.download(&u).await {
+            match client.download(&u, PDF_MAX_BYTES).await {
                 Ok(bytes) => {
                     let file = format!("{}_{}_{}_{}.pdf", &completed_at[..10.min(completed_at.len())], safe_filename(&person_name), sid, safe_filename(&n));
                     originals.push((file, bytes));
@@ -785,11 +889,12 @@ async fn import_submission(
     let _gate = state.gate.read().await;
     let mut tx = service::begin_write(&state.pool).await?;
     if let Some(name) = &new_person {
-        sqlx::query("INSERT INTO persons (id, name, email, created_at) VALUES (?, ?, ?, ?)")
+        sqlx::query("INSERT INTO persons (id, name, email, created_at, name_key) VALUES (?, ?, ?, ?, ?)")
             .bind(&person_id)
             .bind(name)
             .bind(&email)
             .bind(now())
+            .bind(normalize_name(name))
             .execute(&mut *tx)
             .await?;
     }

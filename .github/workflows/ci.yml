@@ -48,6 +48,24 @@ jobs:
           bun install --frozen-lockfile
           bun run check
 
+  # Known-vulnerability check of the locked dependencies. Not required for publishing, so a
+  # newly published advisory flags pull requests without blocking an urgent release.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Audit Rust dependencies
+        working-directory: server
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      - name: Audit web and bot dependencies
+        run: |
+          curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.5"
+          for dir in web bot; do (cd "$dir" && ~/.bun/bin/bun audit); done
+
   publish:
     name: Publish ${{ matrix.component }}
     if: github.event_name == 'push' && github.ref_type == 'tag' && !github.event.deleted

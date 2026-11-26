@@ -6,6 +6,18 @@ export class ApiError extends Error {
   }
 }
 
+export async function eventsAvailable() {
+  try {
+    const response = await fetch(`${config.apiUrl}/api/events/health`, {
+      redirect: 'error',
+      signal: AbortSignal.timeout(6000),
+    });
+    return response.status === 204;
+  } catch {
+    return false;
+  }
+}
+
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${config.apiUrl}/api/v1${path}`, {
     method,
@@ -55,7 +67,6 @@ export interface PersonView {
 }
 
 export const api = {
-  templates: () => call<{ slug: string; name: string; validity_days: number | null }[]>('GET', '/templates'),
   status: (discordId: string, template: string) =>
     call<Status>('GET', `/persons/${discordId}/status?template=${encodeURIComponent(template)}`),
   person: (discordId: string) => call<PersonView>('GET', `/persons/${discordId}`),

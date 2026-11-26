@@ -2,7 +2,6 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  ApplicationCommandType,
   Client,
   EmbedBuilder,
   Events,
@@ -17,8 +16,8 @@ import {
   type MessageCreateOptions,
   type User,
 } from 'discord.js';
-import { api, ApiError, type Submission } from './api';
-import { commandHelp, legacyCommands } from './commands';
+import { api, ApiError, eventsAvailable, type Submission } from './api';
+import { commandHelp } from './commands';
 import { config } from './config';
 
 const client = new Client({
@@ -136,11 +135,36 @@ async function privateReply(message: Message, payload: string | MessageCreateOpt
   }
 }
 
+function eventCommand(args: string, eventsUrl: URL) {
+  const [action = '', id, ...extra] = args.toLowerCase().split(/\s+/);
+  const url = new URL(eventsUrl);
+  if (!id && ['', 'list', 'create'].includes(action)) {
+    if (action === 'create') url.pathname += '/new';
+  } else if (id && extra.length === 0 && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(id) && ['show', 'edit', 'cancel'].includes(action)) {
+    url.pathname += '/' + id;
+    if (action !== 'show') url.searchParams.set('action', action);
+  } else {
+    return null;
+  }
+  return { content: 'Continue in pdfsign with your Authentik account.', components: [linkRow(url.toString(), 'Open events')] };
+}
+
 async function handleCommand(message: Message, command: string, args: string) {
   const user = message.author;
   const staff = isStaff(message);
   const reply = (payload: string | MessageCreateOptions) => privateReply(message, payload);
-  const help = (intro?: string) => message.reply({ content: commandHelp(staff, intro), allowedMentions: { repliedUser: false } });
+  const help = (intro?: string) => message.reply({
+    content: commandHelp(staff, Boolean(config.apiKey), Boolean(config.eventsUrl), intro),
+    allowedMentions: { repliedUser: false },
+  });
+  if (command === 'help') return help();
+  if (command === 'event' && config.eventsUrl) {
+    const payload = eventCommand(args, config.eventsUrl);
+    if (!payload) return help('Choose an event command below.');
+    if (!(await eventsAvailable())) return reply('The calendar is currently unavailable. Try again later.');
+    return reply(payload);
+  }
+  if (!config.apiKey) return help('Unknown command.');
   const askToRegister = (purpose: Purpose) =>
     reply({ content: 'Register your name and ZIP code to continue.', components: [registerRow(purpose)] });
   const [first, second, ...rest] = args.split(/\s+/);
@@ -157,8 +181,6 @@ async function handleCommand(message: Message, command: string, args: string) {
   }
 
   switch (command) {
-    case 'help':
-      return help();
     case 'register':
       return args ? help('Use !register without arguments to enter your details privately.') : askToRegister('none');
 
@@ -271,8 +293,9 @@ async function handleInteraction(i: Interaction) {
 
   if (i.isModalSubmit() && i.customId.startsWith('reg:')) {
     const purpose = i.customId.slice(4);
-    const name = i.fields.getTextInputValue('name').trim();
-    await api.register(i.user.id, name, i.user.username, i.fields.getTextInputValue('zip').trim());
+    // a registered person keeps their name; the server refuses a different one
+    const view = await api.register(i.user.id, i.fields.getTextInputValue('name').trim(), i.user.username, i.fields.getTextInputValue('zip').trim());
+    const name = view.person.name;
     if (purpose === 'none') return i.reply({ content: `✅ Registered as **${name}**.`, flags: MessageFlags.Ephemeral });
     const out = await resolve(i.user, purpose);
     if (out.kind === 'valid') return i.reply({ content: `✅ Registered as **${name}**. Your waiver is valid until ${fmt(out.sub.valid_until)}.`, flags: MessageFlags.Ephemeral });
@@ -283,6 +306,7 @@ async function handleInteraction(i: Interaction) {
 }
 
 client.on(Events.InteractionCreate, async (i) => {
+  if (!config.apiKey) return;
   try {
     await handleInteraction(i);
   } catch (e) {
@@ -297,7 +321,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
 // Clicking "Interested" on a Discord scheduled event counts as signing up.
 client.on(Events.GuildScheduledEventUserAdd, async (event, user) => {
-  if (!config.watchScheduledEvents) return;
+  if (!config.apiKey || !config.watchScheduledEvents) return;
   try {
     const name = event.name ?? 'the event';
     const out = await resolve(user, 'event');
@@ -314,19 +338,9 @@ client.on(Events.GuildScheduledEventUserAdd, async (event, user) => {
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}. Listening for ! commands.`);
-  if (process.env.REGISTER_COMMANDS === 'false') return;
-
-  // Retire the old pdfsign commands while preserving other application commands.
-  const managers = [c.application.commands, ...c.guilds.cache.map((guild) => guild.commands)];
-  for (const manager of managers) {
-    try {
-      const registered = await manager.fetch({});
-      for (const command of registered.values()) {
-        if (command.type === ApplicationCommandType.ChatInput && legacyCommands.has(command.name)) await command.delete();
-      }
-    } catch (error) {
-      console.error('legacy slash command cleanup failed', error);
-    }
-  }
 });
-client.login(config.token);
+if (config.eventsUrl && !(await eventsAvailable())) {
+  console.error('Event commands require a reachable calendar connected to pdfsign.');
+  process.exit(1);
+}
+await client.login(config.token);

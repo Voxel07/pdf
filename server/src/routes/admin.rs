@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::activity;
-use crate::auth::{create_api_key, AdminUser, Staff};
+use crate::auth::{create_api_key, AdminUser, SessionUser, Staff};
 use crate::backup;
 use crate::docuseal;
 use crate::export_job;
@@ -28,6 +28,7 @@ pub fn router() -> Router<AppState> {
         .route("/me", get(me))
         .route("/stats", get(stats))
         .route("/users", get(users))
+        .route("/users/{id}/sessions", delete(revoke_sessions))
         .route("/data", delete(reset_data))
         .route("/templates", get(templates).post(upload_template))
         .route("/templates/{id}", get(template).put(update).delete(archive_template))
@@ -59,21 +60,29 @@ pub fn router() -> Router<AppState> {
         .route("/backup/config", axum::routing::put(backup_config))
         .route("/backup/run", post(backup_run))
         .route("/backup/files/{name}", get(backup_download).delete(backup_delete))
-        .route("/export", post(export_disk))
-        .route("/export.zip", get(export_zip))
         .route("/export/jobs", post(export_job_start))
         .route("/export/jobs/{id}", get(export_job_status))
         .route("/export/jobs/{id}/download", get(export_job_download))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
 }
 
-async fn me(Staff(u): Staff, State(st): State<AppState>) -> Json<Value> {
-    Json(json!({ "user": u, "public_url": st.cfg.public_url, "export_dir": st.cfg.export_dir, "version": crate::version() }))
+async fn me(SessionUser(u): SessionUser, State(st): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "user": u, "public_url": st.cfg.public_url,
+        "export_dir": u.is_staff().then_some(&st.cfg.export_dir),
+        "version": crate::version(), "events_enabled": st.cfg.events_enabled,
+    }))
 }
 
 async fn users(_u: AdminUser, State(st): State<AppState>) -> AppResult<Json<Value>> {
     let list: Vec<crate::auth::User> = sqlx::query_as("SELECT * FROM users ORDER BY last_login_at DESC").fetch_all(&st.pool).await?;
     Ok(Json(json!(list)))
+}
+
+async fn revoke_sessions(AdminUser(actor): AdminUser, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
+    let count = crate::auth::revoke_user_sessions(&st, &id).await?;
+    activity::info(&st.pool, "auth", Some(&actor.username), format!("revoked {count} session(s) for user {id}")).await;
+    Ok(Json(json!({ "revoked": count })))
 }
 
 async fn stats(_u: Staff, State(st): State<AppState>) -> AppResult<Json<Value>> {
@@ -100,11 +109,16 @@ struct ListQuery {
 
 async fn templates(_u: Staff, State(st): State<AppState>, Query(q): Query<ListQuery>) -> AppResult<Json<Value>> {
     let list = list_templates(&st.pool, q.archived).await?;
+    let counts: std::collections::HashMap<String, i64> =
+        sqlx::query_as::<_, (String, i64)>("SELECT template_id, COUNT(*) FROM submissions GROUP BY template_id")
+            .fetch_all(&st.pool)
+            .await?
+            .into_iter()
+            .collect();
     let mut out = Vec::new();
     for t in list {
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM submissions WHERE template_id = ?").bind(&t.id).fetch_one(&st.pool).await?;
         let mut v = serde_json::to_value(&t).unwrap();
-        v["submission_count"] = json!(n);
+        v["submission_count"] = json!(counts.get(&t.id).copied().unwrap_or(0));
         out.push(v);
     }
     Ok(Json(json!(out)))
@@ -209,13 +223,13 @@ async fn template_pdf(_u: Staff, State(st): State<AppState>, Path(id): Path<Stri
 /// Renders the template with sample values so positions can be checked.
 async fn preview_pdf(_u: Staff, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Response> {
     let t = get_template(&st.pool, &id).await?;
-    let bytes = service::template_pdf(&st, &t.id).await?;
+    let doc = st.template_document(&t.id, &t.pdf_sha256).await?;
     let sig = sample_signature();
     let items: Vec<DrawItem> = t
         .fields
         .iter()
         .map(|f| DrawItem {
-            field: f,
+            field: f.clone(),
             value: match f.kind {
                 FieldKind::Signature => DrawValue::Image(sig.clone()),
                 FieldKind::Date => DrawValue::Text(format_date("2025-12-31", f.format.as_deref())),
@@ -225,7 +239,7 @@ async fn preview_pdf(_u: Staff, State(st): State<AppState>, Path(id): Path<Strin
             },
         })
         .collect();
-    let out = pdf::render(&bytes, &items, None)?;
+    let out = st.blocking(move || pdf::render(&doc, &items, None)).await??;
     Ok(pdf_response(out, &format!("{}-preview.pdf", t.slug), true))
 }
 
@@ -555,8 +569,9 @@ async fn create_person_admin(Staff(u): Staff, State(st): State<AppState>, Json(r
 async fn update_person(_u: Staff, State(st): State<AppState>, Path(id): Path<String>, Json(req): Json<PersonReq>) -> AppResult<Json<Person>> {
     let name = validate_person_name(&req.name)?;
     let zip = normalize_zip(req.zip.as_deref())?;
-    sqlx::query("UPDATE persons SET name = ?, email = ?, zip = ?, notes = COALESCE(?, notes) WHERE id = ?")
-        .bind(name)
+    sqlx::query("UPDATE persons SET name = ?, name_key = ?, email = ?, zip = ?, notes = COALESCE(?, notes) WHERE id = ?")
+        .bind(&name)
+        .bind(normalize_name(&name))
         .bind(req.email.filter(|e| !e.is_empty()))
         .bind(zip)
         .bind(req.notes)
@@ -694,70 +709,6 @@ async fn activity_list(_u: Staff, State(st): State<AppState>, Query(f): Query<ac
 // ---------------------------------------------------------------------------------------
 // Export
 
-#[derive(Deserialize, Default)]
-struct ExportReq {
-    dir: Option<String>,
-    /// Only this template (id or slug); all templates when empty.
-    template_id: Option<String>,
-}
-
-async fn log_export(st: &AppState, actor: &str, what: &str, r: &ExportReport) {
-    if r.failed.is_empty() {
-        activity::info(&st.pool, "export", Some(actor), format!("{what}: {} PDF(s) written", r.written)).await;
-    } else {
-        activity::error(
-            &st.pool,
-            "export",
-            Some(actor),
-            format!("{what}: {} PDF(s) written, {} failed: {}", r.written, r.failed.len(), r.failed.join("; ")),
-        )
-        .await;
-    }
-}
-
-async fn export_disk(AdminUser(u): AdminUser, State(st): State<AppState>, body: Option<Json<ExportReq>>) -> AppResult<Json<Value>> {
-    let req = body.map(|b| b.0).unwrap_or_default();
-    let dir = req.dir.filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from).unwrap_or_else(|| st.cfg.export_dir.clone());
-    let template = req.template_id.as_deref().filter(|t| !t.is_empty());
-    let template_name = match template {
-        Some(t) => Some(get_template(&st.pool, t).await?.name),
-        None => None,
-    };
-    let report = export_all(&st, &dir, template).await?;
-    let what = format!("export of {} to {}", template_name.map(|n| format!("'{n}'")).unwrap_or_else(|| "all templates".into()), report.dir);
-    log_export(&st, &u.username, &what, &report).await;
-    Ok(Json(json!(report)))
-}
-
-#[derive(Deserialize)]
-struct ZipQuery {
-    template_id: Option<String>,
-}
-
-async fn export_zip(Staff(u): Staff, State(st): State<AppState>, Query(q): Query<ZipQuery>) -> AppResult<Response> {
-    let template = match q.template_id.as_deref().filter(|t| !t.is_empty()) {
-        Some(t) => Some(get_template(&st.pool, t).await?),
-        None => None,
-    };
-    let (bytes, report) = service::export_zip(&st, template.as_ref().map(|t| t.id.as_str())).await?;
-    let what = format!("ZIP download of {}", template.as_ref().map(|t| format!("'{}'", t.name)).unwrap_or_else(|| "all templates".into()));
-    log_export(&st, &u.username, &what, &report).await;
-    let name = match &template {
-        Some(t) => format!("signatures-{}-{}.zip", t.slug, chrono::Utc::now().format("%Y-%m-%d")),
-        None => format!("signatures-{}.zip", chrono::Utc::now().format("%Y-%m-%d")),
-    };
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/zip".to_string()),
-            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
-            // failed document IDs are listed in FAILED.txt inside the archive
-            (header::HeaderName::from_static("x-export-failed"), report.failed.len().to_string()),
-        ],
-        bytes,
-    )
-        .into_response())
-}
-
 #[derive(Deserialize)]
 struct ExportJobReq {
     kind: export_job::Kind,
@@ -772,6 +723,9 @@ async fn export_job_start(Staff(u): Staff, State(st): State<AppState>, Json(req)
         return Err(AppError::new(axum::http::StatusCode::FORBIDDEN, "forbidden", "only admins can export to the server disk"));
     }
     let dir = req.dir.filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from);
+    if let Some(dir) = &dir {
+        check_output_dir(&st, dir)?;
+    }
     let job = export_job::start(&st, export_job::StartRequest { kind: req.kind, dir, template: req.template_id }, &u.username).await?;
     Ok(Json(json!(job)))
 }
@@ -782,18 +736,12 @@ async fn export_job_status(_u: Staff, State(st): State<AppState>, Path(id): Path
 
 async fn export_job_download(_u: Staff, State(st): State<AppState>, Path(id): Path<String>) -> AppResult<Response> {
     let job = export_job::get(&st, &id)?;
-    let (name, zip) = export_job::take_zip(&st, &id)?;
     let failed = job.report.map(|r| r.failed.len()).unwrap_or(0);
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/zip".to_string()),
-            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
-            (header::HeaderName::from_static("x-export-failed"), failed.to_string()),
-        ],
-        // the job no longer holds the archive, so this is the last reference
-        std::sync::Arc::try_unwrap(zip).unwrap_or_else(|z| (*z).clone()),
-    )
-        .into_response())
+    let (name, zip) = export_job::take_zip(&st, &id)?;
+    let path = zip.0.clone();
+    // the archive file is deleted once the download stream (holding `zip`) is dropped
+    let failed = vec![(header::HeaderName::from_static("x-export-failed"), failed.to_string())];
+    download_response(&path, "application/zip", &name, zip, failed).await
 }
 
 // ---------------------------------------------------------------------------------------
@@ -806,7 +754,7 @@ async fn backup_overview(_u: AdminUser, State(st): State<AppState>) -> AppResult
     Ok(Json(json!({
         "config": cfg, "status": status, "files": files,
         "default_dir": st.cfg.backup_dir, "timezone": chrono::Local::now().format("server time, UTC%:z").to_string(),
-        "running": st.backup_running.try_lock().is_err(),
+        "running": st.backup_running.try_lock().is_err(), "includes_calendar": st.cfg.events_enabled,
     })))
 }
 
@@ -823,15 +771,10 @@ async fn backup_run(AdminUser(u): AdminUser, State(st): State<AppState>) -> AppR
 async fn backup_download(_u: AdminUser, State(st): State<AppState>, Path(name): Path<String>) -> AppResult<Response> {
     let cfg = backup::load_config(&st).await?;
     let path = backup::backup_path(&cfg.dir, &name)?;
-    let bytes = tokio::fs::read(&path).await.map_err(|_| AppError::not_found("backup not found"))?;
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/zip".to_string()),
-            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
-        ],
-        bytes,
-    )
-        .into_response())
+    if !tokio::fs::symlink_metadata(&path).await.is_ok_and(|meta| meta.file_type().is_file()) {
+        return Err(AppError::not_found("backup not found"));
+    }
+    download_response(&path, "application/zip", &name, (), vec![]).await
 }
 
 async fn backup_delete(_u: AdminUser, State(st): State<AppState>, Path(name): Path<String>) -> AppResult<Json<Value>> {

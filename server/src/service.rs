@@ -42,7 +42,7 @@ pub async fn reset_application_data(state: &AppState) -> AppResult<()> {
                    DELETE FROM oidc_states; DELETE FROM settings; DELETE FROM activity_log; DELETE FROM sqlite_sequence;")
         .execute(&mut *tx).await?;
     tx.commit().await?;
-    state.limiter.lock().unwrap().clear();
+    state.clear_rate_limits();
     *state.import.lock().unwrap() = Default::default();
     state.export_jobs.lock().unwrap().clear();
     state.clean_deleted_pdfs().await?;
@@ -97,7 +97,8 @@ pub async fn create_template(
     sections: Vec<Section>,
     source: Option<String>,
 ) -> AppResult<Template> {
-    let pages = pdf::page_count(pdf_bytes).map_err(|e| AppError::bad_request(format!("{e:#}")))?;
+    let bytes = pdf_bytes.to_vec();
+    let pages = state.blocking(move || pdf::page_count(&bytes)).await?.map_err(|e| AppError::bad_request(format!("{e:#}")))?;
     if pages == 0 {
         return Err(AppError::bad_request("PDF has no pages"));
     }
@@ -243,8 +244,8 @@ fn validate_template(t: &Template) -> AppResult<()> {
         {
             return bad(format!("field '{}' lies (partly) outside its page", f.name));
         }
-        if f.font_size.is_some_and(|s| !s.is_finite() || s <= 0.0) {
-            return bad(format!("field '{}' has an invalid font size", f.name));
+        if f.font_size.is_some_and(|s| !s.is_finite() || s <= 0.0 || f64::from(s) > pdf::MAX_FONT_SIZE) {
+            return bad(format!("field '{}' needs a font size between 1 and {}", f.name, pdf::MAX_FONT_SIZE));
         }
         if let (Some(min), Some(max)) = (f.min, f.max) {
             if min > max {
@@ -300,8 +301,8 @@ pub async fn template_pdf(state: &AppState, template_id: &str) -> AppResult<Vec<
 // ---------------------------------------------------------------------------------------
 // Persons & discord accounts
 
-pub async fn get_person(pool: &SqlitePool, id: &str) -> AppResult<Person> {
-    Ok(sqlx::query_as("SELECT * FROM persons WHERE id = ?").bind(id).fetch_one(pool).await?)
+pub async fn get_person<'e>(ex: impl SqliteExecutor<'e>, id: &str) -> AppResult<Person> {
+    Ok(sqlx::query_as("SELECT * FROM persons WHERE id = ?").bind(id).fetch_one(ex).await?)
 }
 
 pub async fn person_by_discord(pool: &SqlitePool, discord_id: &str) -> AppResult<Option<Person>> {
@@ -352,12 +353,13 @@ pub async fn create_person(pool: &SqlitePool, name: &str, email: Option<&str>, z
     let name = validate_person_name(name)?;
     let zip = normalize_zip(zip)?;
     let id = new_id();
-    sqlx::query("INSERT INTO persons (id, name, email, zip, created_at) VALUES (?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO persons (id, name, email, zip, created_at, name_key) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(&id)
         .bind(&name)
         .bind(email)
         .bind(zip)
         .bind(now())
+        .bind(normalize_name(&name))
         .execute(pool)
         .await?;
     get_person(pool, &id).await
@@ -388,7 +390,10 @@ pub async fn attach_discord(pool: &SqlitePool, person_id: &str, discord_id: &str
     Ok(())
 }
 
-/// Creates the person for a Discord account if needed, or updates name/username.
+/// Creates the person for a Discord account if needed. A registered person keeps their
+/// name: it identifies them on signed documents and general links, so only staff change it
+/// (repeating the registered name in another spelling is accepted). A ZIP code is only
+/// added when none is on file, and the Discord username is refreshed.
 pub async fn upsert_discord_person(
     pool: &SqlitePool,
     discord_id: &str,
@@ -402,12 +407,15 @@ pub async fn upsert_discord_person(
         Some(p) => {
             if let Some(n) = name {
                 let n = validate_person_name(n)?;
-                if n != p.name {
-                    sqlx::query("UPDATE persons SET name = ? WHERE id = ?").bind(&n).bind(&p.id).execute(pool).await?;
+                if normalize_name(&n) != normalize_name(&p.name) {
+                    return Err(AppError::conflict(
+                        "already_registered",
+                        format!("You are already registered as {}. Ask the staff to change your registered name.", p.name),
+                    ));
                 }
             }
-            if let Some(z) = &zip {
-                sqlx::query("UPDATE persons SET zip = ? WHERE id = ?").bind(z).bind(&p.id).execute(pool).await?;
+            if let (Some(z), None) = (&zip, &p.zip) {
+                sqlx::query("UPDATE persons SET zip = ? WHERE id = ? AND zip IS NULL").bind(z).bind(&p.id).execute(pool).await?;
             }
             if let Some(u) = username {
                 sqlx::query("UPDATE discord_accounts SET username = ? WHERE discord_id = ?")
@@ -472,47 +480,43 @@ pub async fn link_discord_accounts(
     get_person(pool, &old.id).await
 }
 
-/// All persons whose name matches (normalized) the given name.
+/// All persons whose name matches (normalized) the given name, through the indexed `name_key`.
 pub async fn persons_by_name(pool: &SqlitePool, name: &str) -> AppResult<Vec<Person>> {
-    let norm = normalize_name(name);
-    let all: Vec<Person> = sqlx::query_as("SELECT * FROM persons").fetch_all(pool).await?;
-    Ok(all.into_iter().filter(|p| normalize_name(&p.name) == norm).collect())
+    Ok(sqlx::query_as("SELECT * FROM persons WHERE name_key = ? ORDER BY created_at, id")
+        .bind(normalize_name(name))
+        .fetch_all(pool)
+        .await?)
 }
 
 pub enum Identified {
     Person(Person),
-    /// A zip code is needed: `true` = several people share the name, `false` = new person.
-    NeedZip(bool),
+    /// Every general-link signer confirms their name with their ZIP code.
+    NeedZip,
+    /// Nobody with this name and ZIP code is registered: a new person (name, ZIP).
+    New(String, String),
 }
 
-/// Identifies a signer of a general (QR) link by name, using the zip code only to tell
-/// people with the same name apart. Unknown signers become new persons.
+/// Identifies a signer of a general (QR) link by name and ZIP code. The ZIP code is always
+/// required and must match the one on file, so knowing a member's name is not enough to sign
+/// as them, and the answer to a request without one does not reveal whether the name exists.
+/// A registered namesake without a ZIP code on file cannot be told apart, so staff help.
 pub async fn identify_by_name(pool: &SqlitePool, name: &str, zip: Option<&str>) -> AppResult<Identified> {
     let name = validate_person_name(name)?;
     if name.split_whitespace().count() < 2 {
         return Err(AppError::bad_request("please enter your first and last name"));
     }
-    let zip = normalize_zip(zip)?;
+    let Some(zip) = normalize_zip(zip)? else { return Ok(Identified::NeedZip) };
     let candidates = persons_by_name(pool, &name).await?;
-    match (candidates.len(), zip) {
-        (0, None) => Ok(Identified::NeedZip(false)),
-        (0, Some(z)) => Ok(Identified::Person(create_person(pool, &name, None, Some(&z)).await?)),
-        (1, _) => Ok(Identified::Person(candidates.into_iter().next().unwrap())),
-        (_, None) => Ok(Identified::NeedZip(true)),
-        (_, Some(z)) => {
-            let any_without_zip = candidates.iter().any(|p| p.zip.is_none());
-            let mut hits: Vec<Person> = candidates.into_iter().filter(|p| p.zip.as_deref() == Some(z.as_str())).collect();
-            match hits.len() {
-                // a namesake without zip on file could be this person - don't guess
-                0 if any_without_zip => Err(AppError::conflict(
-                    "ambiguous",
-                    "several people with this name are registered - please ask the staff to help you",
-                )),
-                0 => Ok(Identified::Person(create_person(pool, &name, None, Some(&z)).await?)),
-                1 => Ok(Identified::Person(hits.remove(0))),
-                _ => Err(AppError::conflict("ambiguous", "we could not identify you unambiguously - please contact the staff")),
-            }
-        }
+    let any_without_zip = candidates.iter().any(|p| p.zip.is_none());
+    let mut hits: Vec<Person> = candidates.into_iter().filter(|p| p.zip.as_deref() == Some(zip.as_str())).collect();
+    match hits.len() {
+        1 => Ok(Identified::Person(hits.remove(0))),
+        0 if any_without_zip => Err(AppError::conflict(
+            "zip_unknown",
+            "we cannot confirm who you are with this name and zip code - please ask the staff to help you",
+        )),
+        0 => Ok(Identified::New(name, zip)),
+        _ => Err(AppError::conflict("ambiguous", "we could not identify you unambiguously - please contact the staff")),
     }
 }
 
@@ -529,10 +533,10 @@ pub async fn begin_write(pool: &SqlitePool) -> AppResult<sqlx::Transaction<'stat
     Ok(pool.begin_with("BEGIN IMMEDIATE").await?)
 }
 
-pub async fn submission_by_token(pool: &SqlitePool, token: &str) -> AppResult<Submission> {
+pub async fn submission_by_token<'e>(ex: impl SqliteExecutor<'e>, token: &str) -> AppResult<Submission> {
     sqlx::query_as("SELECT * FROM submissions WHERE token = ?")
         .bind(token)
-        .fetch_optional(pool)
+        .fetch_optional(ex)
         .await?
         .ok_or_else(|| AppError::not_found("this link is invalid"))
 }
@@ -648,25 +652,28 @@ pub fn done_sections(t: &Template, values: &[FieldValue], rounds: &[Round]) -> B
     done
 }
 
+/// Signature images from signers: PNG data URLs only (what the signature pad produces).
 fn decode_image_data_url(s: &str) -> AppResult<Vec<u8>> {
     let b64 = s
-        .strip_prefix("data:")
-        .and_then(|r| r.split_once(";base64,"))
-        .map(|(_, d)| d)
-        .ok_or_else(|| AppError::bad_request("signature must be a base64 image data URL"))?;
+        .strip_prefix("data:image/png;base64,")
+        .ok_or_else(|| AppError::bad_request("signature must be a base64 PNG data URL"))?;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .map_err(|_| AppError::bad_request("invalid base64 in signature"))?;
-    normalize_image(&raw).map_err(|e| AppError::bad_request(format!("invalid signature image: {e}")))
+    normalize_image_as(&raw, Some(image::ImageFormat::Png)).map_err(|e| AppError::bad_request(format!("invalid signature image: {e}")))
 }
 
-/// Re-encodes any image as a compact PNG (max 1000px wide).
+/// Re-encodes an image (PNG, JPEG, WebP or GIF) as a compact PNG of at most 1000x1000 px.
 pub fn normalize_image(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+    normalize_image_as(raw, None)
+}
+
+fn normalize_image_as(raw: &[u8], format: Option<image::ImageFormat>) -> anyhow::Result<Vec<u8>> {
     if raw.len() > 8 * 1024 * 1024 {
         anyhow::bail!("image too large");
     }
-    let mut img = image::load_from_memory(raw)?;
-    if img.width() > 1000 {
+    let mut img = pdf::decode_image(raw, format)?;
+    if img.width() > 1000 || img.height() > 1000 {
         img = img.resize(1000, 1000, image::imageops::FilterType::Triangle);
     }
     let mut out = Vec::new();
@@ -750,13 +757,14 @@ fn check_round(t: &Template, sub: &Submission, done: &BTreeSet<u32>, touched: &B
 /// `BEGIN IMMEDIATE` transaction that also writes the round, its values and the status.
 /// Of two competing rounds for the same section exactly one commits.
 pub async fn submit_round(
-    pool: &SqlitePool,
+    state: &AppState,
     sub: &Submission,
     t: &Template,
     person: &Person,
     input: &HashMap<String, String>,
     ctx: SubmitContext<'_>,
 ) -> AppResult<Submission> {
+    let pool = &state.pool;
     let values = load_values(pool, &sub.id).await?;
     let rounds = load_rounds(pool, &sub.id).await?;
     let done = done_sections(t, &values, &rounds);
@@ -775,7 +783,12 @@ pub async fn submit_round(
             return Err(AppError::conflict("already_signed", format!("'{}' was already signed and cannot be changed", f.name)));
         }
         let value = validate_value(f, raw)?;
-        let image = if f.kind == FieldKind::Signature { Some(decode_image_data_url(raw)?) } else { None };
+        let image = if f.kind == FieldKind::Signature {
+            let raw = raw.clone();
+            Some(state.blocking(move || decode_image_data_url(&raw)).await??)
+        } else {
+            None
+        };
         touched.insert(f.section);
         new_values.push((f.id.clone(), value, image));
     }
@@ -926,17 +939,31 @@ pub fn display_value(f: &Field, v: &FieldValue) -> Option<DrawValue> {
 
 pub async fn render_submission(state: &AppState, sub: &Submission) -> AppResult<(String, Vec<u8>)> {
     let t = get_template(&state.pool, &sub.template_id).await?;
+    let r = render_submission_for(state, sub, &t).await?;
+    Ok((r.filename, r.bytes))
+}
+
+pub struct Rendered {
+    pub filename: String,
+    pub bytes: Vec<u8>,
+    pub person: Person,
+    pub accounts: Vec<DiscordAccount>,
+}
+
+/// Renders a submission of the (already loaded) template `t`; also returns the person and
+/// Discord accounts it loaded, so exports need no second lookup.
+pub async fn render_submission_for(state: &AppState, sub: &Submission, t: &Template) -> AppResult<Rendered> {
     let person = get_person(&state.pool, &sub.person_id).await?;
     let values = load_values(&state.pool, &sub.id).await?;
     let rounds = load_rounds(&state.pool, &sub.id).await?;
     let accounts = discord_accounts(&state.pool, &person.id).await?;
-    let template_bytes = template_pdf(state, &t.id).await?;
+    let template_doc = state.template_document(&t.id, &t.pdf_sha256).await?;
 
     let mut items = Vec::new();
     for v in &values {
         if let Some(f) = t.fields.iter().find(|f| f.id == v.field_id) {
             if let Some(dv) = display_value(f, v) {
-                items.push(DrawItem { field: f, value: dv });
+                items.push(DrawItem { field: f.clone(), value: dv });
             }
         }
     }
@@ -1001,10 +1028,10 @@ pub async fn render_submission(state: &AppState, sub: &Submission) -> AppResult<
     } else {
         None
     };
-    let bytes = pdf::render(&template_bytes, &items, audit.as_deref())?;
+    let bytes = state.blocking(move || pdf::render(&template_doc, &items, audit.as_deref())).await??;
     let date = sub.completed_at.as_deref().unwrap_or(&sub.created_at).get(..10).unwrap_or("").to_string();
     let filename = format!("{}_{}_{}.pdf", date, safe_filename(&person.name), &sub.id[..8]);
-    Ok((filename, bytes))
+    Ok(Rendered { filename, bytes, person, accounts })
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -1049,15 +1076,13 @@ pub async fn export_all_with(state: &AppState, dir: &Path, template: Option<&str
             templates.insert(s.template_id.clone(), get_template(&state.pool, &s.template_id).await?);
         }
         let t = &templates[&s.template_id];
-        match render_submission(state, &s).await {
-            Ok((name, bytes)) => {
+        match render_submission_for(state, &s, t).await {
+            Ok(Rendered { filename: name, bytes, person, accounts }) => {
                 let sub_dir: PathBuf = dir.join(&t.slug);
                 tokio::fs::create_dir_all(&sub_dir).await?;
                 tokio::fs::write(sub_dir.join(&name), bytes).await?;
                 report.written += 1;
-                let person = get_person(&state.pool, &s.person_id).await?;
-                let ids: Vec<String> =
-                    discord_accounts(&state.pool, &person.id).await?.into_iter().map(|a| a.discord_id).collect();
+                let ids: Vec<String> = accounts.into_iter().map(|a| a.discord_id).collect();
                 let v = validity(t, &s);
                 csv.push_str(&format!(
                     "{},{},{},{},{},{},{},{}\n",
@@ -1079,18 +1104,18 @@ pub async fn export_all_with(state: &AppState, dir: &Path, template: Option<&str
     Ok(report)
 }
 
+/// Quotes a CSV cell. Cells that a spreadsheet would run as a formula (`=`, `+`, `-`, `@`,
+/// tab or carriage return first) get a leading apostrophe, since names are self-registered.
 fn csv_escape(s: &str) -> String {
-    if s.contains([',', '"', '\n']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() }
+    let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) { format!("'{s}") } else { s.to_string() };
+    if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s }
 }
 
-/// Same as [`export_all`] but as an in-memory zip archive. Documents that could not be
-/// rendered are listed in `FAILED.txt` inside the archive and in the returned report.
-pub async fn export_zip(state: &AppState, template: Option<&str>) -> AppResult<(Vec<u8>, ExportReport)> {
-    export_zip_with(state, template, &|_, _| {}).await
-}
-
-/// [`export_zip`] reporting its progress; after the last document the archive is packed.
-pub async fn export_zip_with(state: &AppState, template: Option<&str>, progress: ExportProgress<'_>) -> AppResult<(Vec<u8>, ExportReport)> {
+/// Same as [`export_all`] but as a zip archive in a temporary file (deleted when the
+/// returned handle is dropped), reporting its progress; after the last document the
+/// archive is packed. Documents that could not be rendered are listed in `FAILED.txt`
+/// inside the archive and in the returned report.
+pub async fn export_zip_with(state: &AppState, template: Option<&str>, progress: ExportProgress<'_>) -> AppResult<(TempFile, ExportReport)> {
     let tmp = std::env::temp_dir().join(format!("pdfsign-export-{}", random_token(10)));
     let report = match export_all_with(state, &tmp, template, progress).await {
         Ok(r) => r,
@@ -1103,25 +1128,24 @@ pub async fn export_zip_with(state: &AppState, template: Option<&str>, progress:
         let text = format!("{} document(s) could not be rendered and are missing from this archive:\n{}\n", report.failed.len(), report.failed.join("\n"));
         tokio::fs::write(tmp.join("FAILED.txt"), text).await?;
     }
-    let tmp2 = tmp.clone();
-    let zip = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-        let mut buf = Cursor::new(Vec::new());
-        {
-            let mut zw = zip::ZipWriter::new(&mut buf);
-            let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-            for entry in walk(&tmp2)? {
-                let rel = entry.strip_prefix(&tmp2)?.to_string_lossy().replace('\\', "/");
-                zw.start_file(rel, opts)?;
-                std::io::Write::write_all(&mut zw, &std::fs::read(&entry)?)?;
-            }
-            zw.finish()?;
+    let archive = TempFile(tmp.with_extension("zip"));
+    let (src, dst) = (tmp.clone(), archive.0.clone());
+    let packed = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let mut zw = zip::ZipWriter::new(std::io::BufWriter::new(std::fs::File::create(&dst)?));
+        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(true);
+        for entry in walk(&src)? {
+            let rel = entry.strip_prefix(&src)?.to_string_lossy().replace('\\', "/");
+            zw.start_file(rel, opts)?;
+            std::io::copy(&mut std::fs::File::open(&entry)?, &mut zw)?;
         }
-        Ok(buf.into_inner())
+        std::io::Write::flush(&mut zw.finish()?)?;
+        Ok(())
     })
     .await
-    .context("zip task")?;
+    .context("zip task");
     let _ = tokio::fs::remove_dir_all(&tmp).await;
-    Ok((zip?, report))
+    packed??;
+    Ok((archive, report))
 }
 
 fn walk(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -1161,4 +1185,47 @@ pub fn submission_summary(state: &AppState, s: &Submission, person_name: &str, t
         "source": s.source,
         "url": state.sign_url(&s.token),
     })
+}
+
+// ---------------------------------------------------------------------------------------
+// Output folders
+
+/// `path` with its longest existing prefix resolved (symlinks, `..`); the missing rest is
+/// appended as given.
+fn resolve_partly(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut rest = Vec::new();
+    while !existing.exists() {
+        match existing.file_name() {
+            Some(name) => {
+                rest.push(name.to_owned());
+                existing.pop();
+            }
+            None => break,
+        }
+    }
+    let mut out = existing.canonicalize().unwrap_or(existing);
+    for name in rest.iter().rev() {
+        out.push(name);
+    }
+    out
+}
+
+/// Export and backup folders chosen in the admin UI must be absolute and must not be the
+/// published web folder (anything written there is downloadable without login) or hold the
+/// live data (the database folder itself or its template PDFs).
+pub fn check_output_dir(state: &AppState, dir: &Path) -> AppResult<()> {
+    if !dir.is_absolute() || dir.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(AppError::bad_request("the folder must be an absolute path without '..'"));
+    }
+    let target = resolve_partly(dir);
+    let web = resolve_partly(&state.cfg.web_dir);
+    let data = resolve_partly(&state.cfg.data_dir);
+    if target.starts_with(&web) {
+        return Err(AppError::bad_request("the folder must not be inside the published web folder"));
+    }
+    if target == data || target.starts_with(data.join("templates")) {
+        return Err(AppError::bad_request("the folder must not be the data folder or its templates folder"));
+    }
+    Ok(())
 }
