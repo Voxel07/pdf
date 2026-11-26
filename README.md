@@ -108,6 +108,8 @@ Set `EVENTS_ENABLED=true` in the root `.env`. Generate three distinct URL-safe s
 
 To use an existing standalone calendar, set `CALENDAR_URL` in pdfsign to the calendar origin reachable from the pdfsign container. Set the same `CALENDAR_PDFSIGN_TOKEN` on both services, restart the calendar, and start pdfsign and the bot with `docker compose up -d --build pdfsign bot`. Use HTTPS if the connection leaves a trusted private network.
 
+The standalone calendar web app has its own authentik sign-in and personal calendars. See [its README](calendar/README.md#sign-in-with-authentik).
+
 Open **Events** after logging in to pdfsign. Admins and staff can create, edit, and cancel events. To let community members view events and RSVP, create a group in Authentik and set `OIDC_EVENT_GROUP` to its name. This group grants access to events only.
 
 Set the bot's `PUBLIC_URL` to the public HTTPS address of pdfsign. These commands send an Authentik-protected link by DM. The browser uses the same session as the signing app and asks for confirmation before saving or cancelling an event.

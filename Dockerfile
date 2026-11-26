@@ -11,8 +11,13 @@ RUN bun run build
 FROM rust:1.100.0-slim-trixie AS server
 WORKDIR /src
 COPY server/Cargo.toml server/Cargo.lock ./
-# cache dependencies
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
+# Cache dependencies by building them against a placeholder main.rs. The placeholder uses none
+# of them, so cargo's unused_dependencies lint is allowed for this step only; the real manifest
+# is copied back before the actual build.
+RUN mkdir src && echo 'fn main() {}' > src/main.rs \
+ && printf '\n[lints.cargo]\nunused_dependencies = "allow"\n' >> Cargo.toml \
+ && cargo build --release --locked && rm -rf src
+COPY server/Cargo.toml ./
 COPY server/src ./src
 RUN touch src/main.rs && cargo build --release --locked
 

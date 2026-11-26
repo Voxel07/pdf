@@ -5,7 +5,7 @@
     "": {
       "name": "diy-calendar",
       "dependencies": {
-        "ical-generator": "11.1.2",
+        "ical-generator": "11.1.4",
       },
       "devDependencies": {
         "@sveltejs/vite-plugin-svelte": "7.3.2",
@@ -115,7 +115,7 @@
 
     "fsevents": ["fsevents@2.3.3", "", { "os": "darwin", "hasInstallScript": true }, "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw=="],
 
-    "ical-generator": ["ical-generator@11.1.2", "", { "peerDependencies": { "@touch4it/ical-timezones": ">=1.6.0", "@types/luxon": ">= 1.26.0", "@types/mocha": ">= 8.2.1", "@types/node": "*", "dayjs": ">= 1.10.0", "luxon": ">= 1.26.0", "moment": ">= 2.29.0", "moment-timezone": ">= 0.5.33", "rrule": ">= 2.6.8" }, "optionalPeers": ["@touch4it/ical-timezones", "@types/luxon", "@types/mocha", "@types/node", "dayjs", "luxon", "moment", "moment-timezone", "rrule"] }, "sha512-/pr2IbEhMoEGsLvCsgRoK5yEtFwLC08JuI6sQy0jejJq/94CTttaRHgnrmsvsM2290YOXfZjwyZc9J4UQhB+vA=="],
+    "ical-generator": ["ical-generator@11.1.4", "", { "peerDependencies": { "@touch4it/ical-timezones": ">=1.6.0", "@types/luxon": ">= 1.26.0", "@types/mocha": ">= 8.2.1", "@types/node": "*", "dayjs": ">= 1.10.0", "luxon": ">= 1.26.0", "moment": ">= 2.29.0", "moment-timezone": ">= 0.5.33", "rrule": ">= 2.6.8" }, "optionalPeers": ["@touch4it/ical-timezones", "@types/luxon", "@types/mocha", "@types/node", "dayjs", "luxon", "moment", "moment-timezone", "rrule"] }, "sha512-mQRAdCWEroPJOG3j/xDom+AzG31bgplmGLIoGXG+mko26LB+80iexHsCnfoycvMldkaHMjW76E6aTFuGRG6JWQ=="],
 
     "is-reference": ["is-reference@3.0.3", "", { "dependencies": { "@types/estree": "^1.0.6" } }, "sha512-ixkJoqQvAP88E6wLydLGGqCJsrFUnqoH6HnaczB8XmDH1oaWU+xxdptvikTgaEhtZ53Ky6YXiBuUI2WXLMCwjw=="],
 

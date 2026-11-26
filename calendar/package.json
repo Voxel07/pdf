@@ -11,7 +11,7 @@
     "check": "svelte-check --tsconfig ./tsconfig.json && tsc -p tsconfig.server.json"
   },
   "dependencies": {
-    "ical-generator": "11.1.2"
+    "ical-generator": "11.1.4"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "7.3.2",

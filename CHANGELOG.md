@@ -7,10 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-11-26
+
 ### Added
 
 - pdfsign and DIY Calendar can be installed as standalone web apps on iPhone, Android, and desktop Chrome.
 - Releases publish a calendar image, `ghcr.io/voxel07/pdf-calendar`. Set `PDFSIGN_CALENDAR_IMAGE` to use it with Docker Compose. A locally built calendar image is now tagged `pdfsign-calendar`.
+- Personal calendars: each user gets a private **Personal** calendar on first sign-in, can add more, and switches between them and the shared calendar from the header. Each has its own subscription link. pdfsign, the admin token API, and webhooks still see only the shared calendar, which holds all existing events.
+- Click a day in the month view to create an event there, or drag across days to create a multi-day event.
+
+### Changed
+
+- **DIY Calendar sign-in uses authentik.** The web app no longer accepts the admin token. Create an authentik OAuth2/OpenID provider with the redirect URI `<CALENDAR_PUBLIC_URL>/auth/callback`, then set `CALENDAR_PUBLIC_URL`, `CALENDAR_OIDC_ISSUER`, `CALENDAR_OIDC_CLIENT_ID`, and `CALENDAR_OIDC_CLIENT_SECRET`. Optional `CALENDAR_OIDC_GROUP` limits who can sign in, and `CALENDAR_OIDC_ADMIN_GROUP` limits who can edit the shared calendar. The event API still uses `CALENDAR_ADMIN_TOKEN`. See [the calendar README](calendar/README.md#sign-in-with-authentik).
+- DIY Calendar now uses pdfsign's look, including its light and dark themes and theme switch.
+- Calendar notifications, such as a deleted event, appear as a snackbar that disappears after a few seconds.
+
+### Fixed
+
+- pdfsign now stops with a clear message when its data folder holds a database from 0.0.3 or earlier, instead of failing with `no such column: name_key`.
+- When event commands are unavailable, the bot's startup error now names the cause: pdfsign unreachable, events disabled in pdfsign, or calendar unavailable. pdfsign logs why it cannot reach the calendar: `CALENDAR_URL` or `CALENDAR_PDFSIGN_TOKEN` missing, the calendar unreachable, or the token rejected.
 
 ## [0.0.4] - 2026-11-26
 

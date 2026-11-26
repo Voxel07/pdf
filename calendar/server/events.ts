@@ -55,7 +55,21 @@ export function parseEvent(raw: unknown, defaults?: Partial<EventInput>): Requir
   };
 }
 
-type StoredEvent = Omit<CalendarEvent, 'all_day'> & { all_day: number; deleted_at: string | null };
+/** The calendar shared with pdfsign, the admin token API and `CALENDAR_FEED_TOKEN`. */
+export const SHARED = 'shared';
+const MAX_CALENDARS = 20;
+
+type StoredEvent = Omit<CalendarEvent, 'all_day'> & { all_day: number; calendar_id: string; deleted_at: string | null };
+export interface OwnCalendar { id: string; name: string; created_at: string }
+export interface UiSession { sub: string; name: string; shared_editor: boolean; expires_at: number }
+
+export function parseCalendarName(value: unknown) {
+  const name = typeof value === 'string' ? value.trim() : '';
+  if (!name || [...name].length > 80 || /[\x00-\x1f\x7f]/.test(name)) {
+    throw new HttpError(400, 'Calendar name must be a single line of 1 to 80 characters.');
+  }
+  return name;
+}
 type Phase = 'upcoming' | 'ongoing' | 'ended' | 'cancelled';
 type Rsvp = 'going' | 'maybe' | 'declined';
 export type Scope = 'read' | 'write' | 'calendar';
@@ -168,10 +182,49 @@ export function openCalendar(filename: string, webhookEnabled: boolean) {
       FROM events;
     `);
   }).immediate();
+  db.transaction(() => {
+    // Calendars before per-user calendars hold only shared events.
+    const columns = db.query<{ name: string }, []>('SELECT name FROM pragma_table_info(\'events\')').all();
+    if (!columns.some((column) => column.name === 'calendar_id')) {
+      db.exec(`ALTER TABLE events ADD COLUMN calendar_id TEXT NOT NULL DEFAULT '${SHARED}'`);
+    }
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS events_calendar ON events(calendar_id, starts_at, id);
+      CREATE TABLE IF NOT EXISTS calendars (
+        id TEXT PRIMARY KEY NOT NULL,
+        owner TEXT NOT NULL,
+        name TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS calendars_owner ON calendars(owner, created_at);
+      CREATE TABLE IF NOT EXISTS calendar_users (
+        sub TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        first_login_at TEXT NOT NULL,
+        last_login_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS ui_sessions (
+        token_hash TEXT PRIMARY KEY NOT NULL,
+        sub TEXT NOT NULL,
+        name TEXT NOT NULL,
+        shared_editor INTEGER NOT NULL CHECK (shared_editor IN (0, 1)),
+        expires_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS oidc_logins (
+        state TEXT PRIMARY KEY NOT NULL,
+        verifier TEXT NOT NULL,
+        nonce TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+    `);
+  }).immediate();
 
-  const find = db.query<StoredEvent, [string]>('SELECT * FROM events WHERE id = ? AND deleted_at IS NULL');
-  const list = db.query<StoredEvent, []>('SELECT * FROM events WHERE deleted_at IS NULL ORDER BY starts_at, id');
-  const feed = db.query<StoredEvent, [string]>('SELECT * FROM events WHERE deleted_at IS NULL OR deleted_at >= ? ORDER BY starts_at, id');
+  const find = db.query<StoredEvent, [string, string]>('SELECT * FROM events WHERE id = ? AND calendar_id = ? AND deleted_at IS NULL');
+  const findCalendar = db.query<{ calendar_id: string }, [string]>('SELECT calendar_id FROM events WHERE id = ? AND deleted_at IS NULL');
+  const list = db.query<StoredEvent, [string]>('SELECT * FROM events WHERE calendar_id = ? AND deleted_at IS NULL ORDER BY starts_at, id');
+  const feed = db.query<StoredEvent, [string, string]>(
+    'SELECT * FROM events WHERE calendar_id = ?1 AND (deleted_at IS NULL OR deleted_at >= ?2) ORDER BY starts_at, id',
+  );
   const enqueue = db.query('INSERT INTO webhook_outbox (id, type, body, next_attempt) VALUES (?, ?, ?, ?)');
   const nextDelivery = db.query<Delivery, [number]>(`
     SELECT id, type, body, attempts FROM webhook_outbox
@@ -184,8 +237,8 @@ export function openCalendar(filename: string, webhookEnabled: boolean) {
   );
   const saveRequest = db.query('INSERT INTO create_requests (key, request, response) VALUES (?, ?, ?)');
   const insert = db.query(`
-    INSERT INTO events (id, title, description, location, starts_at, ends_at, all_day, status, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO events (id, title, description, location, starts_at, ends_at, all_day, status, created_at, updated_at, calendar_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const update = db.query(`
     UPDATE events SET title = ?, description = ?, location = ?, starts_at = ?, ends_at = ?, all_day = ?,
@@ -193,8 +246,8 @@ export function openCalendar(filename: string, webhookEnabled: boolean) {
   `);
   const remove = db.query('UPDATE events SET deleted_at = ?, updated_at = ?, revision = ? WHERE id = ?');
 
-  function get(id: string) {
-    const event = find.get(id);
+  function get(id: string, calendar = SHARED) {
+    const event = find.get(id, calendar);
     if (!event) throw new HttpError(404, 'Event not found.');
     return publicEvent(event);
   }
@@ -205,8 +258,9 @@ export function openCalendar(filename: string, webhookEnabled: boolean) {
     }
   }
 
-  function recordChange(type: WebhookType, event: CalendarEvent) {
-    if (!webhookEnabled) return;
+  function recordChange(type: WebhookType, event: CalendarEvent, calendar: string) {
+    // Personal calendars stay private to their owner.
+    if (!webhookEnabled || calendar !== SHARED) return;
     const id = crypto.randomUUID();
     const body = JSON.stringify({ id, type, occurred_at: event.updated_at, event });
     enqueue.run(id, type, body, Date.now());
@@ -214,7 +268,7 @@ export function openCalendar(filename: string, webhookEnabled: boolean) {
 
   const detail = db.query<EventDetail, [string | null, string]>(`
     SELECT event_details.*, (SELECT response FROM event_rsvps WHERE event_id = id AND user_id = ?1) AS my_rsvp
-    FROM event_details WHERE id = ?2 AND deleted_at IS NULL
+    FROM event_details WHERE id = ?2 AND calendar_id = '${SHARED}' AND deleted_at IS NULL
   `);
   function getDetail(id: string, user: string | null = null) {
     const event = detail.get(user, id);
@@ -227,7 +281,9 @@ export function openCalendar(filename: string, webhookEnabled: boolean) {
   );
   const savePdfsignRequest = db.query('INSERT INTO pdfsign_create_requests VALUES (?, ?, ?, ?)');
 
-  const create = db.transaction((input: ReturnType<typeof parseEvent>, key: string | null, actor?: string, fingerprint?: string) => {
+  const create = db.transaction((
+    input: ReturnType<typeof parseEvent>, key: string | null, calendar = SHARED, actor?: string, fingerprint?: string,
+  ) => {
     if (key && actor) {
       const previous = findPdfsignRequest.get(actor, key);
       if (previous) {
@@ -237,6 +293,8 @@ export function openCalendar(filename: string, webhookEnabled: boolean) {
         return { event: get(previous.event_id), replay: true };
       }
     } else if (key) {
+      // Keys sent for a personal calendar never match those of another calendar.
+      if (calendar !== SHARED) key = `${calendar}:${key}`;
       const previous = findRequest.get(key);
       if (previous) {
         const previousInput = parseEvent(JSON.parse(previous.request));
@@ -249,16 +307,18 @@ export function openCalendar(filename: string, webhookEnabled: boolean) {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     insert.run(id, input.title, input.description, input.location, input.starts_at, input.ends_at,
-      Number(input.all_day), input.status, now, now);
-    const event = get(id);
+      Number(input.all_day), input.status, now, now, calendar);
+    const event = get(id, calendar);
     if (key && actor) savePdfsignRequest.run(actor, key, fingerprint!, id);
     else if (key) saveRequest.run(key, JSON.stringify(input), JSON.stringify(event));
-    recordChange('event.created', event);
+    recordChange('event.created', event, calendar);
     return { event, replay: false };
   });
 
-  const edit = db.transaction((id: string, raw: unknown, partial: boolean, expected: string | null, pdfsign = false) => {
-    const current = get(id);
+  const edit = db.transaction((
+    id: string, calendar: string, raw: unknown, partial: boolean, expected: string | null, pdfsign = false,
+  ) => {
+    const current = get(id, calendar);
     if (pdfsign && expected !== `"${current.revision}"`) {
       throw new HttpError(409, 'This event was updated. Reload the event and try again.', 'stale_revision');
     }
@@ -268,17 +328,50 @@ export function openCalendar(filename: string, webhookEnabled: boolean) {
     if (!pdfsign && fields.every((name) => input[name] === current[name])) return current;
     update.run(input.title, input.description, input.location, input.starts_at, input.ends_at,
       Number(input.all_day), input.status, current.revision + 1, new Date().toISOString(), id);
-    const event = get(id);
-    recordChange('event.updated', event);
+    const event = get(id, calendar);
+    recordChange('event.updated', event, calendar);
     return event;
   });
 
-  const erase = db.transaction((id: string, expected: string | null) => {
-    const current = get(id);
+  const erase = db.transaction((id: string, calendar: string, expected: string | null) => {
+    const current = get(id, calendar);
     requireRevision(current, expected);
     const event = { ...current, revision: current.revision + 1, updated_at: new Date().toISOString() };
     remove.run(event.updated_at, event.updated_at, event.revision, id);
-    recordChange('event.deleted', event);
+    recordChange('event.deleted', event, calendar);
+  });
+
+  const ownCalendars = db.query<OwnCalendar, [string]>(
+    'SELECT id, name, created_at FROM calendars WHERE owner = ? ORDER BY created_at, id',
+  );
+  const ownCalendar = db.query<OwnCalendar, [string, string]>('SELECT id, name, created_at FROM calendars WHERE id = ? AND owner = ?');
+  const insertCalendar = db.query('INSERT INTO calendars (id, owner, name, created_at) VALUES (?, ?, ?, ?)');
+
+  const createCalendar = db.transaction((owner: string, name: string) => {
+    if (ownCalendars.all(owner).length >= MAX_CALENDARS) {
+      throw new HttpError(409, `You can have up to ${MAX_CALENDARS} calendars.`);
+    }
+    const calendar = { id: crypto.randomUUID(), name, created_at: new Date().toISOString() };
+    insertCalendar.run(calendar.id, owner, calendar.name, calendar.created_at);
+    return calendar;
+  });
+
+  const deleteCalendar = db.transaction((id: string, owner: string) => {
+    if (!ownCalendar.get(id, owner)) throw new HttpError(404, 'Calendar not found.');
+    db.query('DELETE FROM events WHERE calendar_id = ?').run(id);
+    db.query('DELETE FROM create_requests WHERE substr(key, 1, ?) = ?').run(id.length + 1, id + ':');
+    db.query('DELETE FROM calendars WHERE id = ?').run(id);
+  });
+
+  /** Records a sign-in. A user's first sign-in creates their first personal calendar. */
+  const recordLogin = db.transaction((sub: string, name: string) => {
+    const now = new Date().toISOString();
+    const first = db.query(`
+      INSERT INTO calendar_users (sub, name, first_login_at, last_login_at) VALUES (?1, ?2, ?3, ?3)
+      ON CONFLICT (sub) DO NOTHING
+    `).run(sub, name, now).changes > 0;
+    if (!first) db.query('UPDATE calendar_users SET name = ?, last_login_at = ? WHERE sub = ?').run(name, now, sub);
+    else if (ownCalendars.all(sub).length === 0) createCalendar(sub, 'Personal');
   });
 
   const respond = db.transaction((id: string, user: string, response: Rsvp) => {
@@ -294,15 +387,54 @@ export function openCalendar(filename: string, webhookEnabled: boolean) {
   });
 
   return {
-    list: () => list.all().map(publicEvent),
+    list: (calendar = SHARED) => list.all(calendar).map(publicEvent),
     get,
+    /** The calendar an event belongs to, or undefined when there is no such event. */
+    calendarOf: (id: string) => findCalendar.get(id)?.calendar_id,
     create: create.immediate,
     edit: edit.immediate,
     erase: erase.immediate,
+    ownCalendars: (owner: string) => ownCalendars.all(owner),
+    ownCalendar: (id: string, owner: string) => ownCalendar.get(id, owner) ?? undefined,
+    /** Whether a personal calendar exists, for public feeds. */
+    calendarExists: (id: string) => Boolean(db.query('SELECT 1 FROM calendars WHERE id = ?').get(id)),
+    calendarName: (id: string) => db.query<{ name: string }, [string]>('SELECT name FROM calendars WHERE id = ?').get(id)?.name,
+    createCalendar: createCalendar.immediate,
+    renameCalendar(id: string, owner: string, name: string) {
+      if (!db.query('UPDATE calendars SET name = ? WHERE id = ? AND owner = ?').run(name, id, owner).changes) {
+        throw new HttpError(404, 'Calendar not found.');
+      }
+      return ownCalendar.get(id, owner)!;
+    },
+    deleteCalendar: deleteCalendar.immediate,
+    recordLogin: recordLogin.immediate,
+    saveLogin: (state: string, verifier: string, nonce: string) => {
+      db.query('DELETE FROM oidc_logins WHERE created_at < ?').run(Date.now() - 15 * 60_000);
+      if ((db.query<{ count: number }, []>('SELECT count(*) AS count FROM oidc_logins').get()?.count ?? 0) >= 1000) {
+        throw new HttpError(429, 'Too many sign-ins are in progress. Try again in a few minutes.');
+      }
+      db.query('INSERT INTO oidc_logins (state, verifier, nonce, created_at) VALUES (?, ?, ?, ?)').run(state, verifier, nonce, Date.now());
+    },
+    takeLogin: (state: string) => db.query<{ verifier: string; nonce: string }, [string, number]>(
+      'DELETE FROM oidc_logins WHERE state = ? AND created_at >= ? RETURNING verifier, nonce',
+    ).get(state, Date.now() - 15 * 60_000) ?? undefined,
+    saveSession: (hash: string, session: UiSession) => {
+      db.query('DELETE FROM ui_sessions WHERE expires_at < ?').run(Date.now());
+      db.query('INSERT INTO ui_sessions (token_hash, sub, name, shared_editor, expires_at) VALUES (?, ?, ?, ?, ?)')
+        .run(hash, session.sub, session.name, Number(session.shared_editor), session.expires_at);
+    },
+    findSession(hash: string): UiSession | undefined {
+      const row = db.query<Omit<UiSession, 'shared_editor'> & { shared_editor: number }, [string, number]>(
+        'SELECT sub, name, shared_editor, expires_at FROM ui_sessions WHERE token_hash = ? AND expires_at > ?',
+      ).get(hash, Date.now());
+      return row ? { ...row, shared_editor: Boolean(row.shared_editor) } : undefined;
+    },
+    deleteSession: (hash: string) => db.query('DELETE FROM ui_sessions WHERE token_hash = ?').run(hash),
     getDetail,
     page(phase: string | null, limit: number, offset: number) {
       const rows = db.query<EventDetail, [string | null, number, number]>(`
-        SELECT *, NULL AS my_rsvp FROM event_details WHERE deleted_at IS NULL AND (?1 IS NULL OR phase = ?1)
+        SELECT *, NULL AS my_rsvp FROM event_details
+        WHERE calendar_id = '${SHARED}' AND deleted_at IS NULL AND (?1 IS NULL OR phase = ?1)
         ORDER BY CASE WHEN phase IN ('upcoming', 'ongoing') THEN 0 ELSE 1 END,
           CASE WHEN phase IN ('upcoming', 'ongoing') THEN starts_at END, starts_at DESC, id LIMIT ?2 OFFSET ?3
       `).all(phase, limit + 1, offset);
@@ -316,10 +448,10 @@ export function openCalendar(filename: string, webhookEnabled: boolean) {
     saveCredential: (id: string, name: string, scope: Scope, hash: string, createdAt: string, createdBy: string) =>
       db.query('INSERT INTO event_credentials VALUES (?, ?, ?, ?, ?, ?)').run(id, name, scope, hash, createdAt, createdBy),
     revokeCredential: (id: string) => db.query('DELETE FROM event_credentials WHERE id = ?').run(id).changes,
-    renderFeed(name: string, pdfsignUrl?: string) {
+    renderFeed(name: string, pdfsignUrl?: string, calendarId = SHARED) {
       const calendar = ical({ name, prodId: pdfsignUrl ? '-//pdfsign//Events//EN' : '-//DIY Calendar//Calendar//EN' });
       const retainedSince = new Date(Date.now() - 90 * 86_400_000).toISOString();
-      for (const row of feed.all(retainedSince)) {
+      for (const row of feed.all(calendarId, retainedSince)) {
         if (pdfsignUrl && Date.parse(row.ends_at) < Date.parse(retainedSince) && !row.deleted_at) continue;
         calendar.createEvent({
           id: `${row.id}@${pdfsignUrl ? 'pdfsign' : 'diy-calendar'}`,
@@ -341,7 +473,16 @@ export function openCalendar(filename: string, webhookEnabled: boolean) {
     nextDelivery: (now: number) => nextDelivery.get(now),
     delivered: (id: string) => delivered.run(id),
     retry: (id: string, attempts: number, when: number | null) => retry.run(attempts, when, id),
-    snapshot: (path: string) => db.query('VACUUM INTO ?').run(path),
+    snapshot(path: string) {
+      db.query('VACUUM INTO ?').run(path);
+      // Backups never carry sign-ins.
+      const copy = new Database(path, { strict: true });
+      try {
+        copy.exec('DELETE FROM ui_sessions; DELETE FROM oidc_logins; VACUUM;');
+      } finally {
+        copy.close();
+      }
+    },
     close: () => db.close(),
   };
 }

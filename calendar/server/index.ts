@@ -1,10 +1,11 @@
 import { mkdirSync } from 'node:fs';
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import type { CalendarEvent } from '../src/lib/events';
-import { HttpError, openCalendar, parseEvent } from './events';
+import type { CalendarEvent, CalendarInfo } from '../src/lib/events';
+import { createAuth, issuerUrl, type OidcConfig } from './auth';
+import { HttpError, openCalendar, parseCalendarName, parseEvent, SHARED, type UiSession } from './events';
 import { handlePdfsign } from './pdfsign';
 import { startWebhookWorker, type WebhookConfig } from './webhooks';
 
@@ -15,7 +16,13 @@ interface Config {
   name: string;
   publicUrl?: string;
   webhook?: WebhookConfig;
+  oidc?: OidcConfig;
 }
+
+/** The admin token reaches only the shared calendar; a signed-in user also reaches their own. */
+type Principal = { kind: 'admin' } | { kind: 'user'; user: UiSession };
+
+const calendarId = '(?:shared|[0-9a-f-]{36})';
 
 function digest(value: string) {
   return createHash('sha256').update(value).digest();
@@ -53,7 +60,38 @@ export function createCalendarServer(config: Config, filename: string, webDir: s
   const adminHash = digest(config.adminToken);
   const feedHash = digest(config.feedToken);
   const pdfsignHash = config.pdfsignToken ? digest(config.pdfsignToken) : undefined;
+  const auth = createAuth(config.oidc, config.publicUrl, store);
   let snapshotRunning = false;
+
+  // Personal feed links are derived from the feed token, so rotating it rotates every link.
+  const feedSecret = (calendar: string) => createHmac('sha256', config.feedToken).update('calendar:' + calendar).digest('base64url');
+  const feedUrl = (calendar: string) => calendar === SHARED
+    ? `${config.publicUrl ?? ''}/feeds/${config.feedToken}.ics`
+    : `${config.publicUrl ?? ''}/feeds/${calendar}/${feedSecret(calendar)}.ics`;
+
+  function calendars(principal: Principal): CalendarInfo[] {
+    const shared: CalendarInfo = {
+      id: SHARED, name: config.name, personal: false, feed_url: feedUrl(SHARED),
+      writable: principal.kind === 'admin' || principal.user.shared_editor,
+    };
+    if (principal.kind === 'admin') return [shared];
+    return [shared, ...store.ownCalendars(principal.user.sub).map((calendar) => ({
+      id: calendar.id, name: calendar.name, personal: true, writable: true, feed_url: feedUrl(calendar.id),
+    }))];
+  }
+
+  /** Throws 404 for calendars the principal cannot see and 403 for read-only ones it must write. */
+  function access(principal: Principal, calendar: string, write: boolean) {
+    const found = calendars(principal).find((entry) => entry.id === calendar);
+    if (!found) throw new HttpError(404, 'Calendar not found.');
+    if (write && !found.writable) throw new HttpError(403, 'You cannot change events in this calendar.');
+    return found;
+  }
+
+  function principalUser(principal: Principal) {
+    if (principal.kind !== 'user') throw new HttpError(403, 'Personal calendars require signing in to the web app.');
+    return principal.user;
+  }
 
   async function snapshot() {
     if (snapshotRunning) throw new HttpError(409, 'A calendar backup is already running.');
@@ -94,42 +132,107 @@ export function createCalendarServer(config: Config, filename: string, webDir: s
     }
 
     const feed = /^\/feeds\/([A-Za-z0-9_-]+)\.ics$/.exec(pathname);
-    if (feed && timingSafeEqual(digest(feed[1]), feedHash)) {
+    const personalFeed = /^\/feeds\/([0-9a-f-]{36})\/([A-Za-z0-9_-]{43})\.ics$/.exec(pathname);
+    const feedName = feed && timingSafeEqual(digest(feed[1]), feedHash) ? config.name
+      : personalFeed && timingSafeEqual(digest(personalFeed[2]), digest(feedSecret(personalFeed[1])))
+        ? store.calendarName(personalFeed[1]) : undefined;
+    if (feedName !== undefined) {
       if (method !== 'GET' && method !== 'HEAD') return allow('GET, HEAD');
-      return new Response(method === 'HEAD' ? null : store.renderFeed(config.name), {
+      const body = method === 'HEAD' ? null : store.renderFeed(feedName, undefined, personalFeed ? personalFeed[1] : SHARED);
+      return new Response(body, {
         headers: { 'Content-Type': 'text/calendar; charset=utf-8', 'Cache-Control': 'no-cache, private' },
       });
     }
 
+    if (pathname === '/auth/login') return method === 'GET' ? auth.login() : allow('GET');
+    if (pathname === '/auth/callback') return method === 'GET' ? auth.callback(request) : allow('GET');
+    if (pathname === '/auth/logout') return method === 'POST' ? auth.logout(request) : allow('POST');
+
     if (pathname.startsWith('/api/')) {
       const token = /^Bearer (.+)$/i.exec(request.headers.get('Authorization') ?? '')?.[1];
-      if (!token || !timingSafeEqual(digest(token), adminHash)) {
-        return json({ error: 'A valid admin token is required.' }, 401, { 'WWW-Authenticate': 'Bearer' });
+      let principal: Principal;
+      if (token) {
+        if (!timingSafeEqual(digest(token), adminHash)) {
+          return json({ error: 'A valid admin token is required.' }, 401, { 'WWW-Authenticate': 'Bearer' });
+        }
+        principal = { kind: 'admin' };
+      } else {
+        const user = auth.user(request);
+        if (!user) {
+          return json({ error: 'Sign in to continue.', sign_in: auth.available }, 401, { 'WWW-Authenticate': 'Bearer' });
+        }
+        // Cookies must not let other sites act for the user.
+        if (method !== 'GET' && method !== 'HEAD' && ['cross-site', 'same-site'].includes(request.headers.get('Sec-Fetch-Site') ?? '')) {
+          return json({ error: 'Cross-site requests are not allowed.' }, 403);
+        }
+        principal = { kind: 'user', user };
+      }
+      if (pathname === '/api/v1/session') {
+        if (method !== 'GET') return allow('GET');
+        const user = principalUser(principal);
+        return json({ user: { name: user.name, shared_editor: user.shared_editor }, calendars: calendars(principal) });
       }
       if (pathname === '/api/v1/settings') {
         if (method !== 'GET') return allow('GET');
-        return json({ name: config.name, feed_url: `${config.publicUrl ?? ''}/feeds/${config.feedToken}.ics` });
+        return json({ name: config.name, feed_url: feedUrl(SHARED) });
+      }
+      if (pathname === '/api/v1/calendars') {
+        if (method === 'GET') return json({ calendars: calendars(principal) });
+        if (method !== 'POST') return allow('GET, POST');
+        const user = principalUser(principal);
+        const body = await requestJson(request) as { name?: unknown } | null;
+        const created = store.createCalendar(user.sub, parseCalendarName(body?.name));
+        return json(calendars(principal).find((entry) => entry.id === created.id), 201);
+      }
+      const calendarMatch = /^\/api\/v1\/calendars\/([0-9a-f-]{36})$/.exec(pathname);
+      if (calendarMatch) {
+        const user = principalUser(principal);
+        if (method === 'PATCH') {
+          const body = await requestJson(request) as { name?: unknown } | null;
+          store.renameCalendar(calendarMatch[1], user.sub, parseCalendarName(body?.name));
+          return json(calendars(principal).find((entry) => entry.id === calendarMatch[1]));
+        }
+        if (method === 'DELETE') {
+          store.deleteCalendar(calendarMatch[1], user.sub);
+          return new Response(null, { status: 204 });
+        }
+        return allow('PATCH, DELETE');
       }
       if (pathname === '/api/v1/events') {
-        if (method === 'GET') return json({ events: store.list() });
+        const calendar = new URL(request.url).searchParams.get('calendar') ?? SHARED;
+        if (!new RegExp(`^${calendarId}$`).test(calendar)) throw new HttpError(404, 'Calendar not found.');
+        if (method === 'GET') {
+          access(principal, calendar, false);
+          return json({ events: store.list(calendar) });
+        }
         if (method !== 'POST') return allow('GET, POST');
+        access(principal, calendar, true);
         const key = request.headers.get('Idempotency-Key');
         if (key !== null && !/^[A-Za-z0-9._:-]{1,128}$/.test(key)) {
           throw new HttpError(400, 'Idempotency-Key must be 1 to 128 characters and contain only letters, numbers, dots, underscores, colons or hyphens.');
         }
-        const { event, replay } = store.create(parseEvent(await requestJson(request)), key);
+        const { event, replay } = store.create(parseEvent(await requestJson(request)), key, calendar);
         return eventResponse(event, replay ? 200 : 201, true);
       }
       const eventMatch = /^\/api\/v1\/events\/([0-9a-f-]{36})$/.exec(pathname);
       if (eventMatch) {
         const id = eventMatch[1];
+        const calendar = store.calendarOf(id);
+        if (!calendar) throw new HttpError(404, 'Event not found.');
+        try {
+          access(principal, calendar, false);
+        } catch {
+          throw new HttpError(404, 'Event not found.');
+        }
         const revision = request.headers.get('If-Match');
-        if (method === 'GET') return eventResponse(store.get(id));
+        if (method === 'GET') return eventResponse(store.get(id, calendar));
         if (method === 'PUT' || method === 'PATCH') {
-          return eventResponse(store.edit(id, await requestJson(request), method === 'PATCH', revision));
+          access(principal, calendar, true);
+          return eventResponse(store.edit(id, calendar, await requestJson(request), method === 'PATCH', revision));
         }
         if (method === 'DELETE') {
-          store.erase(id, revision);
+          access(principal, calendar, true);
+          store.erase(id, calendar, revision);
           return new Response(null, { status: 204 });
         }
         return allow('GET, PUT, PATCH, DELETE');
@@ -214,10 +317,29 @@ if (import.meta.main) {
     bearer: Bun.env.CALENDAR_WEBHOOK_BEARER_TOKEN,
     secret: Bun.env.CALENDAR_WEBHOOK_SECRET,
   } : undefined;
+  const oidcEnv = ['ISSUER', 'CLIENT_ID', 'CLIENT_SECRET'].map((key) => Bun.env[`CALENDAR_OIDC_${key}`]?.trim() ?? '');
+  let oidc: OidcConfig | undefined;
+  if (oidcEnv.some(Boolean)) {
+    if (!oidcEnv.every(Boolean)) {
+      throw new Error('Set CALENDAR_OIDC_ISSUER, CALENDAR_OIDC_CLIENT_ID and CALENDAR_OIDC_CLIENT_SECRET together.');
+    }
+    if (!publicUrl) throw new Error('CALENDAR_OIDC_* requires CALENDAR_PUBLIC_URL for the sign-in callback.');
+    issuerUrl(oidcEnv[0]);
+    oidc = {
+      issuer: oidcEnv[0],
+      clientId: oidcEnv[1],
+      clientSecret: oidcEnv[2],
+      scopes: Bun.env.CALENDAR_OIDC_SCOPES?.trim() || 'openid profile email',
+      group: Bun.env.CALENDAR_OIDC_GROUP?.trim() || undefined,
+      adminGroup: Bun.env.CALENDAR_OIDC_ADMIN_GROUP?.trim() || undefined,
+    };
+  } else {
+    console.warn('CALENDAR_OIDC_* is not set: the web app cannot sign anyone in. The API still accepts the admin token.');
+  }
   const dataDir = resolve(Bun.env.CALENDAR_DATA_DIR || 'data');
   mkdirSync(dataDir, { recursive: true });
   const app = createCalendarServer(
-    { adminToken, feedToken, pdfsignToken, name, publicUrl: publicUrl ? publicUrl.origin : undefined, webhook },
+    { adminToken, feedToken, pdfsignToken, name, publicUrl: publicUrl ? publicUrl.origin : undefined, webhook, oidc },
     join(dataDir, 'calendar.sqlite'), resolve('dist'), Number(Bun.env.PORT || 3090), Bun.env.HOST || '127.0.0.1',
   );
   console.log(`Calendar listening on ${app.server.url}`);

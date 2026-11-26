@@ -47,6 +47,42 @@ async fn env_with_calendar(events_enabled: bool, url: Option<reqwest::Url>, toke
     Env { st: AppState::new(cfg).await.unwrap(), root }
 }
 
+#[tokio::test]
+async fn databases_from_earlier_versions_are_refused_with_a_clear_error() {
+    let e = env().await;
+    // reopening a current database works
+    AppState::new(clone_config(&e.st.cfg)).await.unwrap();
+    // a 0.0.3 persons table has no name_key column
+    let data_dir = e.root.join("old-data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(data_dir.join("pdfsign.db")).create_if_missing(true);
+    let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE persons (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let err = AppState::new(Config { data_dir, ..clone_config(&e.st.cfg) }).await.err().unwrap();
+    assert!(format!("{err:#}").contains("pdfsign 0.0.3 or earlier"), "{err:#}");
+}
+
+fn clone_config(c: &Config) -> Config {
+    Config {
+        data_dir: c.data_dir.clone(),
+        export_dir: c.export_dir.clone(),
+        backup_dir: c.backup_dir.clone(),
+        public_url: c.public_url.clone(),
+        oidc: None,
+        web_dir: c.web_dir.clone(),
+        max_name_attempts: c.max_name_attempts,
+        audit_page: c.audit_page,
+        events_enabled: c.events_enabled,
+        calendar_url: c.calendar_url.clone(),
+        calendar_pdfsign_token: c.calendar_pdfsign_token.clone(),
+        trusted_proxies: c.trusted_proxies.clone(),
+    }
+}
+
 async fn http_app(state: AppState) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());

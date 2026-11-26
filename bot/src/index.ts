@@ -16,7 +16,7 @@ import {
   type MessageCreateOptions,
   type User,
 } from 'discord.js';
-import { api, ApiError, eventsAvailable, type Submission } from './api';
+import { api, ApiError, eventsAvailable, eventsProblem, type Submission } from './api';
 import { commandHelp } from './commands';
 import { config } from './config';
 
@@ -339,8 +339,11 @@ client.on(Events.GuildScheduledEventUserAdd, async (event, user) => {
 client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}. Listening for ! commands.`);
 });
-if (config.eventsUrl && !(await eventsAvailable())) {
-  console.error('Event commands require a reachable calendar connected to pdfsign.');
-  process.exit(1);
+if (config.eventsUrl) {
+  const problem = await eventsProblem();
+  if (problem) {
+    console.error(`Event commands require a reachable calendar connected to pdfsign: ${problem}`);
+    process.exit(1);
+  }
 }
 await client.login(config.token);

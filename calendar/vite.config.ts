@@ -7,6 +7,6 @@ export default defineConfig({
   plugins: [svelte()],
   server: {
     port: 5174,
-    proxy: { '/api': api, '/feeds': api },
+    proxy: { '/api': api, '/feeds': api, '/auth': api },
   },
 });

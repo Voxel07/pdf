@@ -7,14 +7,20 @@ export class ApiError extends Error {
 }
 
 export async function eventsAvailable() {
+  return (await eventsProblem()) === null;
+}
+
+/** Why event commands are unavailable, or null when the calendar is reachable through pdfsign. */
+export async function eventsProblem(): Promise<string | null> {
+  const url = `${config.apiUrl}/api/events/health`;
   try {
-    const response = await fetch(`${config.apiUrl}/api/events/health`, {
-      redirect: 'error',
-      signal: AbortSignal.timeout(6000),
-    });
-    return response.status === 204;
-  } catch {
-    return false;
+    const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(6000) });
+    if (response.status === 204) return null;
+    if (response.status === 404) return `${url} returned 404. Set EVENTS_ENABLED=true for pdfsign too and restart it.`;
+    if (response.status === 503) return 'pdfsign cannot reach the calendar. Its log names the cause.';
+    return `${url} returned HTTP ${response.status}.`;
+  } catch (e) {
+    return `cannot reach pdfsign at ${config.apiUrl} (${e instanceof Error ? e.message : e}). Check PDFSIGN_URL.`;
   }
 }
 

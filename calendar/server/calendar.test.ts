@@ -3,6 +3,8 @@ import { createHmac } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Database } from 'bun:sqlite';
+import { openCalendar, parseEvent, SHARED } from './events';
 import { createCalendarServer } from './index';
 
 test('event writes update the subscription and persist webhook retries across restart', async () => {
@@ -113,3 +115,41 @@ test('event writes update the subscription and persist webhook retries across re
 function apiInternalHealth(url: URL, token: string) {
   return fetch(new URL('/internal/pdfsign/health', url), { headers: { Authorization: 'Bearer ' + token } });
 }
+
+test('existing events move to the shared calendar and pdfsign never sees personal events', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'diy-calendar-upgrade-'));
+  const file = join(dir, 'calendar.sqlite');
+  try {
+    // The events table as created before per-user calendars.
+    const old = new Database(file);
+    old.exec(`CREATE TABLE events (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, location TEXT NOT NULL,
+      starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, all_day INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled',
+      revision INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT)`);
+    old.query(`INSERT INTO events VALUES ('00000000-0000-4000-8000-000000000001', 'Old', '', '', '2099-01-01', '2099-01-02', 1,
+      'scheduled', 0, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', NULL)`).run();
+    old.close();
+
+    const store = openCalendar(file, true);
+    try {
+      expect(store.list().map((event) => event.title)).toEqual(['Old']);
+      store.recordLogin('user', 'User');
+      const [personal] = store.ownCalendars('user');
+      const input = parseEvent({ title: 'Private', starts_at: '2099-01-01', ends_at: '2099-01-02', all_day: true });
+      const { event } = store.create(input, null, personal.id);
+      expect(store.page(null, 10, 0).events.map((row) => row.title)).toEqual(['Old']);
+      expect(() => store.getDetail(event.id)).toThrow('Event not found.');
+      expect(() => store.edit(event.id, SHARED, { ...input, revision: 0 }, false, '"0"', true)).toThrow('Event not found.');
+      expect(store.renderFeed('pdfsign events', 'https://sign.example.com')).not.toContain('Private');
+      // only the shared calendar feeds webhooks
+      expect(store.nextDelivery(Date.now() + 1000)).toBeNull();
+      store.snapshot(join(dir, 'copy.sqlite'));
+    } finally {
+      store.close();
+    }
+    const copy = new Database(join(dir, 'copy.sqlite'));
+    expect(copy.query('SELECT count(*) AS n FROM ui_sessions').get()).toEqual({ n: 0 });
+    copy.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

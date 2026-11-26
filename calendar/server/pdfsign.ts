@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { HttpError, parseEvent, type CalendarStore } from './events';
+import { HttpError, parseEvent, SHARED, type CalendarStore } from './events';
 
 const prefix = '/internal/pdfsign';
 const uuid = '[0-9a-f-]{36}';
@@ -111,7 +111,7 @@ export async function handlePdfsign(
       }
       const input = parseEvent(await requestJson(request));
       const fingerprint = digest(JSON.stringify(input));
-      const { event: created, replay } = store.create(input, key, actor, fingerprint);
+      const { event: created, replay } = store.create(input, key, SHARED, actor, fingerprint);
       return json(store.getDetail(created.id), replay ? 200 : 201);
     }
     if (!rsvp && id && method === 'PUT') {
@@ -119,7 +119,7 @@ export async function handlePdfsign(
       if (typeof input.revision !== 'number' || !Number.isSafeInteger(input.revision)) {
         throw new HttpError(400, 'A valid event revision is required.');
       }
-      store.edit(id, input, false, `"${input.revision}"`, true);
+      store.edit(id, SHARED, input, false, `"${input.revision}"`, true);
       return json(store.getDetail(id));
     }
   }

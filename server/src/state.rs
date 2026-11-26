@@ -70,6 +70,20 @@ impl AppState {
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new().max_connections(8).connect_with(opts).await?;
+        // schema.sql only creates missing tables, so a database from 0.0.3 or earlier would keep
+        // its old tables and fail on the first new column with a bare SQL error.
+        let (has_persons, has_name_key): (bool, bool) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'persons'), \
+                    EXISTS(SELECT 1 FROM pragma_table_info('persons') WHERE name = 'name_key')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        anyhow::ensure!(
+            !has_persons || has_name_key,
+            "{} was created by pdfsign 0.0.3 or earlier, which this version cannot open. \
+             Stop pdfsign, move the data folder aside, start with an empty DATA_DIR, and re-import from DocuSeal if needed",
+            db_path.display()
+        );
         sqlx::raw_sql(include_str!("schema.sql")).execute(&pool).await.context("creating the database schema")?;
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).max(2);
         let state = Self {

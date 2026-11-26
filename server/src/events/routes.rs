@@ -105,11 +105,30 @@ async fn private_cache(request: Request, next: Next) -> Response {
 }
 
 async fn health(Extension(calendar): Extension<Calendar>) -> AppResult<StatusCode> {
-    let response = calendar.request(Method::GET, "health")?.send().await.map_err(|_| unavailable())?;
-    if response.status() != StatusCode::NO_CONTENT {
+    let Some(origin) = calendar.origin.as_ref() else {
+        tracing::warn!("calendar health: CALENDAR_URL is not set");
+        return Err(unavailable());
+    };
+    if calendar.token.as_deref().is_none_or(str::is_empty) {
+        tracing::warn!("calendar health: CALENDAR_PDFSIGN_TOKEN is not set in pdfsign");
         return Err(unavailable());
     }
-    Ok(StatusCode::NO_CONTENT)
+    let response = calendar.request(Method::GET, "health")?.send().await.map_err(|e| {
+        tracing::warn!("calendar health: cannot reach {origin}: {:#}", anyhow::Error::from(e.without_url()));
+        unavailable()
+    })?;
+    match response.status() {
+        StatusCode::NO_CONTENT => Ok(StatusCode::NO_CONTENT),
+        // the calendar answers 404 to an unknown or missing pdfsign token
+        StatusCode::NOT_FOUND => {
+            tracing::warn!("calendar health: {origin} rejected the service token; set the same CALENDAR_PDFSIGN_TOKEN in pdfsign and the calendar");
+            Err(unavailable())
+        }
+        status => {
+            tracing::warn!("calendar health: {origin} answered HTTP {status}");
+            Err(unavailable())
+        }
+    }
 }
 
 fn event_token(headers: &HeaderMap) -> AppResult<&str> {
