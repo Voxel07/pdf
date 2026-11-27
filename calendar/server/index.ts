@@ -340,7 +340,7 @@ if (import.meta.main) {
   mkdirSync(dataDir, { recursive: true });
   const app = createCalendarServer(
     { adminToken, feedToken, pdfsignToken, name, publicUrl: publicUrl ? publicUrl.origin : undefined, webhook, oidc },
-    join(dataDir, 'calendar.sqlite'), resolve('dist'), Number(Bun.env.PORT || 3090), Bun.env.HOST || '127.0.0.1',
+    join(dataDir, 'calendar.sqlite'), resolve('dist'), Number(Bun.env.PORT || 3090), Bun.env.CALENDAR_HOST || '127.0.0.1',
   );
   console.log(`Calendar listening on ${app.server.url}`);
   process.once('SIGTERM', () => void app.stop());

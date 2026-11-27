@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- PDFs render in Chromium 141 by using the PDF.js compatibility build and worker.
+- The PDF viewer displays an error when a page fails to render and clears it after a successful rerender.
+- The calendar defaults to `127.0.0.1` even when the shell defines `HOST`. Use `CALENDAR_HOST` to set a custom bind address when running the calendar directly.
+
 ## [0.0.5] - 2026-11-26
 
 ### Added

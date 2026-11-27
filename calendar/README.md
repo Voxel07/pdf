@@ -85,4 +85,6 @@ The receiver should return a 2xx response and use `X-Calendar-Delivery` to dedup
 
 Create `.env` as above, including the authentik settings for `http://localhost:5174`, then run `bun install --frozen-lockfile`. Start `bun run dev:api` and `bun run dev` in separate terminals. Vite proxies requests to the Bun server and prints the frontend URL. Run `bun run check`, `bun test`, and `bun run build` from this directory.
 
+The Bun server listens on `127.0.0.1` by default. Set `CALENDAR_HOST` to change the address when running Bun directly. With Docker Compose, set `CALENDAR_BIND` to choose the host address on which the container port is published.
+
 For the cross-service Rust test, start a calendar API with a disposable `CALENDAR_DATA_DIR` and the pdfsign integration enabled. In the Rust test environment set `PDFSIGN_TEST_CALENDAR_URL`, `PDFSIGN_TEST_CALENDAR_TOKEN` (the service token), and `PDFSIGN_TEST_CALENDAR_ADMIN_TOKEN`. From `server/`, run `cargo test --locked event_access_and_calendar_share_the_calendar_database -- --ignored`.

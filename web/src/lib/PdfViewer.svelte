@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { RenderTask } from 'pdfjs-dist';
   import type { Snippet } from 'svelte';
   import type { PdfDoc } from './pdf';
 
@@ -12,20 +13,30 @@
 
   let pages = $state<PageInfo[]>([]);
   let canvases: HTMLCanvasElement[] = $state([]);
+  let loadFailed = $state(false);
+  let pageFailures = $state<Record<number, boolean>>({});
   let container: HTMLDivElement;
   let width = $state(0);
 
   $effect(() => {
     const d = doc;
+    let active = true;
+    pages = [];
+    loadFailed = false;
+    pageFailures = {};
     (async () => {
       const list: PageInfo[] = [];
       for (let i = 0; i < d.numPages; i++) {
         const p = await d.getPage(i + 1);
+        if (!active) return;
         const vp = p.getViewport({ scale: 1 });
         list.push({ index: i, widthPt: vp.width, heightPt: vp.height });
       }
       pages = list;
-    })();
+    })().catch(() => {
+      if (active) loadFailed = true;
+    });
+    return () => { active = false; };
   });
 
   $effect(() => {
@@ -37,35 +48,59 @@
     return () => ro.disconnect();
   });
 
-  let renderGen = 0;
   $effect(() => {
-    if (!width || pages.length === 0) return;
-    const gen = ++renderGen;
+    const d = doc;
+    const renderWidth = width;
+    const renderPages = pages;
+    if (!renderWidth || renderPages.length === 0) return;
+    let active = true;
+    let task: RenderTask | undefined;
     const t = setTimeout(async () => {
       const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
-      for (const info of pages) {
-        if (gen !== renderGen) return;
+      for (const info of renderPages) {
+        if (!active) return;
         const canvas = canvases[info.index];
         if (!canvas) continue;
-        const page = await doc.getPage(info.index + 1);
-        const scale = (width / info.widthPt) * dpr;
-        const vp = page.getViewport({ scale });
-        canvas.width = Math.floor(vp.width);
-        canvas.height = Math.floor(vp.height);
-        await page.render({ canvas, viewport: vp }).promise.catch(() => {});
+        try {
+          const page = await d.getPage(info.index + 1);
+          if (!active) return;
+          const scale = (renderWidth / info.widthPt) * dpr;
+          const vp = page.getViewport({ scale });
+          canvas.width = Math.floor(vp.width);
+          canvas.height = Math.floor(vp.height);
+          task = page.render({ canvas, viewport: vp });
+          await task.promise;
+          if (active) delete pageFailures[info.index];
+        } catch {
+          if (!active) return;
+          pageFailures[info.index] = true;
+          // Release the canvas if PDF.js failed while initializing the render.
+          task?.cancel();
+        } finally {
+          task = undefined;
+        }
       }
     }, 80);
-    return () => clearTimeout(t);
+    return () => {
+      active = false;
+      clearTimeout(t);
+      task?.cancel();
+    };
   });
 </script>
 
 <div class="viewer" bind:this={container}>
+  {#if loadFailed}<p class="error" role="alert">The PDF could not be displayed.</p>{/if}
   {#each pages as info (info.index)}
     <div class="page" style:aspect-ratio="{info.widthPt} / {info.heightPt}" data-page={info.index}>
       <canvas bind:this={canvases[info.index]}></canvas>
-      <div class="overlay">
-        {@render overlay?.(info)}
-      </div>
+      {#if pageFailures[info.index]}
+        <p class="error page-error" role="alert">Page {info.index + 1} could not be displayed.</p>
+      {:else}
+        <div class="overlay">
+          {@render overlay?.(info)}
+        </div>
+      {/if}
     </div>
   {/each}
 </div>
@@ -78,4 +113,5 @@
   }
   canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
   .overlay { position: absolute; inset: 0; }
+  .page-error { position: absolute; inset: 0; display: grid; place-items: center; margin: 0; }
 </style>
